@@ -329,39 +329,327 @@ function buildRowBank(samples, w, h, bpp, includeEntropy = true) {
   return modes;
 }
 
-function filterZlibBrute(rowBank, w, h, bpp, out, level = 3, context = 32768) {
+// Fast lookup tables for pure-JS DEFLATE bit-cost estimation (zero zlib syscalls!)
+const EST_LEN_SYM = new Uint16Array(259);
+const EST_LEN_EX = new Uint8Array(259);
+{
+  const LB = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+  const LE = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+  for (let s = 0; s < 29; s++) {
+    const nxt = s === 28 ? 259 : LB[s + 1];
+    for (let l = LB[s]; l < nxt; l++) { EST_LEN_SYM[l] = 257 + s; EST_LEN_EX[l] = LE[s]; }
+  }
+}
+const EST_DIST_SYM = new Uint8Array(32769);
+const EST_DIST_EX = new Uint8Array(30);
+{
+  const DB = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+  const DE = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+  for (let s = 0; s < 30; s++) {
+    EST_DIST_EX[s] = DE[s];
+    const nxt = s === 29 ? 32769 : DB[s + 1];
+    for (let d = DB[s]; d < nxt; d++) EST_DIST_SYM[d] = s;
+  }
+}
+const EST_LOG2 = new Float64Array(65537);
+for (let i = 1; i <= 65536; i++) EST_LOG2[i] = Math.log2(i);
+const fastLog2 = (v) => (v <= 65536 ? EST_LOG2[v] : Math.log2(v));
+
+const H_BITS = 15;
+const H_SIZE = 1 << H_BITS;
+const H_MASK = H_SIZE - 1;
+const W_SIZE = 32768;
+const W_MASK = W_SIZE - 1;
+
+function hash3Buf(buf, p) {
+  return (((buf[p] | (buf[p + 1] << 8) | (buf[p + 2] << 16)) * 0x1e35a7bd) >>> (32 - H_BITS)) & H_MASK;
+}
+
+/**
+ * Pure-JS zero-syscall incremental per-row LZ77 + adaptive literal-entropy filter selector!
+ * Directly models 32 KiB sliding-window LZ77 match savings + global literal Huffman entropy
+ * without making ANY native zlib.deflateSync calls (zero gVisor syscall overhead).
+ */
+function filterLzRow(rowBank, w, h, bpp, out) {
   const rowLen = w * bpp + 1;
+  const head = new Int32Array(H_SIZE).fill(-1);
+  const prev = new Int32Array(W_SIZE).fill(-1);
+  const hist = new Int32Array(256);
+  let histTot = 0;
+
+  const rowHead = new Int32Array(H_SIZE);
+  const rowStamp = new Uint32Array(H_SIZE);
+  let stamp = 0;
+
+  // Approximate distance cost (symbol + extra bits)
+  const distCost = new Float64Array(30);
+  for (let s = 0; s < 30; s++) distCost[s] = 4.2 + EST_DIST_EX[s];
+  const litCost = new Float64Array(256);
+
   for (let y = 0; y < h; y++) {
     const at = y * rowLen;
-    const before = out.subarray(Math.max(0, at - context), at);
-    let bestT = 0, bestLen = Infinity;
+    const limit = at > W_SIZE ? at - W_SIZE : 0;
+    const logDen = fastLog2(histTot + 256);
+    for (let i = 0; i < 256; i++) litCost[i] = logDen - fastLog2(hist[i] + 1);
+
+    let bestT = 0;
+    let bestBits = Infinity;
+
     for (let t = 0; t < 5; t++) {
       const row = rowBank[t].subarray(at, at + rowLen);
-      const len = deflateSync(
-        row,
-        before.length === 0 ? { level, memLevel: 7 } : { level, memLevel: 7, dictionary: before }
-      ).length;
-      if (len < bestLen) { bestLen = len; bestT = t; }
+      stamp++;
+      let bits = litCost[t]; // filter byte
+      let x = 1;
+      while (x < rowLen) {
+        const b0 = row[x];
+        const rem = rowLen - x;
+        if (rem >= 3) {
+          let bestL = 2;
+          let bestD = 0;
+          // RLE dist=1
+          if (x > 1 && b0 === row[x - 1]) {
+            let l = 1;
+            const lim = rem < 258 ? rem : 258;
+            while (l < lim && row[x + l] === b0) l++;
+            if (l > bestL) { bestL = l; bestD = 1; }
+          }
+          // RLE dist=bpp
+          if (bpp > 1 && x > bpp && b0 === row[x - bpp] && bestL < 258) {
+            let l = 1;
+            const lim = rem < 258 ? rem : 258;
+            while (l < lim && row[x + l] === row[x - bpp + l]) l++;
+            if (l > bestL) { bestL = l; bestD = bpp; }
+          }
+          // Same-row & previous-rows hash match (skip when RLE already found >=16 bytes)
+          if (bestL < 16) {
+            const h3 = hash3Buf(row, x);
+            if (rowStamp[h3] === stamp) {
+              const rx = rowHead[h3];
+              const lim = rem < 258 ? rem : 258;
+              if (row[rx] === b0 && row[rx + 1] === row[x + 1] && row[rx + 2] === row[x + 2]) {
+                let l = 3;
+                while (l < lim && row[rx + l] === row[x + l]) l++;
+                if (l > bestL) { bestL = l; bestD = x - rx; }
+              }
+            }
+            if (at > 0 && bestL < 16) {
+              const b1 = row[x + 1], b2 = row[x + 2];
+              const lim = rem < 258 ? rem : 258;
+              let cand = head[h3];
+              let probes = 4;
+              while (cand >= limit && probes-- > 0) {
+                const cEnd = at - cand;
+                const maxL = cEnd < lim ? cEnd : lim;
+                if (maxL > bestL && out[cand + bestL] === row[x + bestL] && out[cand] === b0 && out[cand + 1] === b1 && out[cand + 2] === b2) {
+                  let l = 3;
+                  while (l < maxL && out[cand + l] === row[x + l]) l++;
+                  if (l > bestL) {
+                    bestL = l;
+                    bestD = (at + x) - cand;
+                    if (bestL >= 16) break;
+                  }
+                }
+                const nxt = prev[cand & W_MASK];
+                if (nxt >= cand) break;
+                cand = nxt;
+              }
+            }
+            rowStamp[h3] = stamp;
+            rowHead[h3] = x;
+          }
+
+          if (bestL >= 3) {
+            const mBits = 6.2 + EST_LEN_EX[bestL] + distCost[EST_DIST_SYM[bestD]];
+            // Compare against emitting literals if short match
+            let litSum = 0;
+            if (bestL <= 5) {
+              for (let k = 0; k < bestL; k++) litSum += litCost[row[x + k]];
+            } else {
+              litSum = 1e9;
+            }
+            if (mBits < litSum) {
+              bits += mBits;
+              x += bestL;
+              continue;
+            }
+          }
+        }
+        bits += litCost[b0];
+        x++;
+      }
+      if (bits < bestBits) { bestBits = bits; bestT = t; }
     }
-    out.set(rowBank[bestT].subarray(at, at + rowLen), at);
+
+    const winRow = rowBank[bestT].subarray(at, at + rowLen);
+    out.set(winRow, at);
+    // Commit row into 32 KiB sliding hash & adaptive histogram
+    for (let x = 0; x < rowLen; x++) {
+      const p = at + x;
+      hist[out[p]]++;
+      if (x + 2 < rowLen) {
+        const h3 = hash3Buf(out, p);
+        prev[p & W_MASK] = head[h3];
+        head[h3] = p;
+      }
+    }
+    histTot += rowLen;
+    if (histTot > 65536) {
+      let s = 0;
+      for (let i = 0; i < 256; i++) { hist[i] >>>= 1; s += hist[i]; }
+      histTot = s;
+    }
   }
   return out;
 }
 
 /**
- * Hybrid banded filter selector with:
- * - Modes: fixed 0..4, per-row pairs, minsum, entropy, AND per-row brute!
- * - Joint-window zlib selection (preserving shared Huffman trees & LZ77 context)
- * - Exact coarse-to-fine row-level boundary refinement with preceding 8 KiB context!
- * - Final bidirectional segment-mode verification pass (seeing BOTH prev & next segments)!
+ * Pure-JS zero-syscall banded filter selector!
+ * Evaluates all candidate filter modes per band using fast greedy LZ77 + joint Shannon Huffman
+ * entropy over (preceding 16 KiB context + band), followed by pure-JS row-level boundary
+ * refinement between adjacent segments. Zero zlib.deflateSync calls!
  */
-function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, level = 4, strategy = constants.Z_DEFAULT_STRATEGY, hysteresis = 10, doBidir = true) {
+function filterBandPureJs(rowBank, w, h, bpp, out, bandH, hysteresis = 16) {
   const rowLen = w * bpp + 1;
   const numModes = rowBank.length;
-  const maxWin = Math.floor(winBytes / rowLen) * rowLen;
-  const work = new Uint8Array(maxWin + bandH * rowLen);
+  const maxWin = Math.min(16384, Math.floor(16384 / rowLen) * rowLen);
   const numBands = Math.ceil(h / bandH);
   const bandModes = new Uint8Array(numBands);
+
+  const ctxHead = new Int32Array(H_SIZE);
+  const ctxStamp = new Uint32Array(H_SIZE);
+  const ctxPrev = new Int32Array(W_SIZE);
+  const bandHead = new Int32Array(H_SIZE);
+  const bandStamp = new Uint32Array(H_SIZE);
+  const bandPrev = new Int32Array(W_SIZE);
+  let cStamp = 0;
+  let bStamp = 0;
+
+  const baseLL = new Int32Array(286);
+  const baseD = new Int32Array(30);
+  const llFreq = new Int32Array(286);
+  const dFreq = new Int32Array(30);
+
+  // Fast greedy LZ77 accumulating token stats on `src[0..len]` with optional read-only context `ctx[0..ctxLen]`
+  const parseSlice = (ctx, ctxLen, src, srcLen, llOut, dOut, hasCtx) => {
+    bStamp++;
+    const bs = bStamp;
+    const cs = cStamp;
+    let extra = 0;
+    let llTot = 0;
+    let dTot = 0;
+
+    for (let p = 0; p < srcLen; ) {
+      const rem = srcLen - p;
+      const b0 = src[p];
+      if (rem >= 3) {
+        let bestL = 2;
+        let bestD = 0;
+        const maxL = rem < 258 ? rem : 258;
+        // Period-1 RLE
+        if ((p > 0 ? src[p - 1] : (ctxLen > 0 ? ctx[ctxLen - 1] : -1)) === b0) {
+          let l = 1;
+          while (l < maxL && src[p + l] === b0) l++;
+          if (l > bestL) { bestL = l; bestD = 1; }
+        }
+        // Period-bpp RLE
+        if (bpp > 1 && p >= bpp && src[p - bpp] === b0 && bestL < maxL) {
+          let l = 1;
+          while (l < maxL && src[p + l] === src[p - bpp + l]) l++;
+          if (l > bestL) { bestL = l; bestD = bpp; }
+        }
+        // Period-rowLen (above row in same slice)
+        if (p >= rowLen && src[p - rowLen] === b0 && bestL < maxL) {
+          let l = 1;
+          while (l < maxL && src[p + l] === src[p - rowLen + l]) l++;
+          if (l > bestL) { bestL = l; bestD = rowLen; }
+        }
+
+        const h3 = hash3Buf(src, p);
+        if (bestL < 64) {
+          const b1 = src[p + 1], b2 = src[p + 2];
+          // Check in-band hash chain (up to 8 probes)
+          if (bandStamp[h3] === bs) {
+            let cand = bandHead[h3];
+            const bLim = p > W_SIZE ? p - W_SIZE : 0;
+            let probes = 8;
+            while (cand >= bLim && probes-- > 0) {
+              if (src[cand + bestL] === src[p + bestL] && src[cand] === b0 && src[cand + 1] === b1 && src[cand + 2] === b2) {
+                let l = 3;
+                while (l < maxL && src[cand + l] === src[p + l]) l++;
+                if (l > bestL) { bestL = l; bestD = p - cand; if (bestL >= 64) break; }
+              }
+              const nxt = bandPrev[cand & W_MASK];
+              if (nxt >= cand) break;
+              cand = nxt;
+            }
+          }
+          // Check preceding context hash chain (up to 6 probes)
+          if (hasCtx && bestL < 64 && ctxStamp[h3] === cs) {
+            let cand = ctxHead[h3];
+            const minCtx = p + ctxLen > W_SIZE ? p + ctxLen - W_SIZE : 0;
+            let probes = 6;
+            while (cand >= minCtx && probes-- > 0) {
+              const avail = ctxLen - cand;
+              const lim = avail < maxL ? avail : maxL;
+              if (lim > bestL && ctx[cand + bestL] === src[p + bestL] && ctx[cand] === b0 && ctx[cand + 1] === b1 && ctx[cand + 2] === b2) {
+                let l = 3;
+                while (l < lim && ctx[cand + l] === src[p + l]) l++;
+                if (l > bestL) { bestL = l; bestD = (ctxLen + p) - cand; if (bestL >= 64) break; }
+              }
+              const nxt = ctxPrev[cand & W_MASK];
+              if (nxt >= cand) break;
+              cand = nxt;
+            }
+          }
+        }
+
+        // Insert current position into band hash
+        bandPrev[p & W_MASK] = bandStamp[h3] === bs ? bandHead[h3] : -1;
+        bandStamp[h3] = bs;
+        bandHead[h3] = p;
+
+        if (bestL >= 3) {
+          llOut[EST_LEN_SYM[bestL]]++; llTot++;
+          const ds = EST_DIST_SYM[bestD];
+          dOut[ds]++; dTot++;
+          extra += EST_LEN_EX[bestL] + EST_DIST_EX[ds];
+          const end = p + bestL;
+          if (bestL <= 24) {
+            for (let q = p + 1; q < end && q + 2 < srcLen; q++) {
+              const hq = hash3Buf(src, q);
+              bandPrev[q & W_MASK] = bandStamp[hq] === bs ? bandHead[hq] : -1;
+              bandStamp[hq] = bs;
+              bandHead[hq] = q;
+            }
+          }
+          p = end;
+          continue;
+        }
+      }
+      llOut[b0]++; llTot++;
+      p++;
+    }
+    return { extra, llTot, dTot };
+  };
+
+  const entropyBits = (ll, d, llTot, dTot, extra) => {
+    let bits = extra + 64;
+    const logLL = fastLog2(llTot + 1);
+    let actLL = 0;
+    for (let i = 0; i < 286; i++) {
+      const c = ll[i];
+      if (c > 0) { actLL++; const l = logLL - fastLog2(c); bits += c * (l > 1 ? l : 1); }
+    }
+    let actD = 0;
+    if (dTot > 0) {
+      const logD = fastLog2(dTot);
+      for (let i = 0; i < 30; i++) {
+        const c = d[i];
+        if (c > 0) { actD++; const l = logD - fastLog2(c); bits += c * (l > 1 ? l : 1); }
+      }
+    }
+    return bits + actLL * 2.2 + actD * 2.8;
+  };
 
   for (let bi = 0; bi < numBands; bi++) {
     const y0 = bi * bandH;
@@ -369,18 +657,38 @@ function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, leve
     const at = y0 * rowLen;
     const bBytes = bh * rowLen;
     const wLen = Math.min(at, maxWin);
-    if (wLen > 0) work.set(out.subarray(at - wLen, at), 0);
-    const slice = work.subarray(0, wLen + bBytes);
-    const prevMode = bi > 0 ? bandModes[bi - 1] : -1;
+    const ctx = wLen > 0 ? out.subarray(at - wLen, at) : null;
 
+    // Index preceding context ONCE per band + get its base token stats
+    baseLL.fill(0);
+    baseD.fill(0);
+    baseLL[256] = 1;
+    let baseExtra = 0, baseLLTot = 1, baseDTot = 0;
+    if (wLen > 0) {
+      cStamp++;
+      const cs = cStamp;
+      for (let p = 0; p + 2 < wLen; p++) {
+        const h3 = hash3Buf(ctx, p);
+        ctxPrev[p & W_MASK] = ctxStamp[h3] === cs ? ctxHead[h3] : -1;
+        ctxStamp[h3] = cs;
+        ctxHead[h3] = p;
+      }
+      const st = parseSlice(null, 0, ctx, wLen, baseLL, baseD, false);
+      baseExtra = st.extra;
+      baseLLTot += st.llTot;
+      baseDTot += st.dTot;
+    }
+
+    const prevMode = bi > 0 ? bandModes[bi - 1] : -1;
     let bestScore = Infinity;
     let bestMode = 0;
     for (let mode = 0; mode < numModes; mode++) {
-      if (mode === 3) continue; // Avg is dominated by Paeth/pairs/minsum inside banded search
-      work.set(rowBank[mode].subarray(at, at + bBytes), wLen);
-      const len = deflateSync(slice, { level, memLevel: 8, strategy }).length;
-      // Small hysteresis bonus to keep previous mode unless switching saves meaningfully
-      const score = mode === prevMode ? len - hysteresis : len;
+      if (mode === 3) continue;
+      llFreq.set(baseLL);
+      dFreq.set(baseD);
+      const st = parseSlice(ctx, wLen, rowBank[mode].subarray(at, at + bBytes), bBytes, llFreq, dFreq, wLen > 0);
+      const bits = entropyBits(llFreq, dFreq, baseLLTot + st.llTot, baseDTot + st.dTot, baseExtra + st.extra);
+      const score = mode === prevMode ? bits - hysteresis : bits;
       if (score < bestScore) { bestScore = score; bestMode = mode; }
     }
     bandModes[bi] = bestMode;
@@ -397,11 +705,9 @@ function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, leve
     else segs.push({ y0, y1, mode: m });
   }
 
-  // Exact local boundary refinement between every pair of adjacent segments!
-  const halfSpan = Math.min(bandH, 40);
-  const ctxMax = Math.floor(8192 / rowLen) * rowLen;
-  const spanWork = new Uint8Array(ctxMax + (halfSpan * 2 + 2) * rowLen);
-
+  // Pure-JS coarse-to-fine row-level boundary refinement between adjacent segments (zero syscalls!)
+  const halfSpan = Math.min(bandH, 20);
+  const spanWork = new Uint8Array((halfSpan * 2 + 2) * rowLen);
   for (let si = 0; si < segs.length - 1; si++) {
     const sA = segs[si], sB = segs[si + 1];
     const yMid = sA.y1;
@@ -410,38 +716,31 @@ function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, leve
     const spanH = yEnd - yStart;
     if (spanH < 6) continue;
     const atStart = yStart * rowLen;
-    const ctxLen = Math.min(atStart, ctxMax);
-    if (ctxLen > 0) spanWork.set(out.subarray(atStart - ctxLen, atStart), 0);
-    const spanSlice = spanWork.subarray(0, ctxLen + spanH * rowLen);
+    const spanBytes = spanH * rowLen;
     const bankA = rowBank[sA.mode];
     const bankB = rowBank[sB.mode];
 
-    const evalSplit = (splitY, lv = 2) => {
+    const evalSplit = (splitY) => {
       const k = splitY - yStart;
-      if (k > 0) spanWork.set(bankA.subarray(atStart, atStart + k * rowLen), ctxLen);
-      if (k < spanH) spanWork.set(bankB.subarray(atStart + k * rowLen, yEnd * rowLen), ctxLen + k * rowLen);
-      return deflateSync(spanSlice, { level: lv, memLevel: 8, strategy }).length;
+      if (k > 0) spanWork.set(bankA.subarray(atStart, atStart + k * rowLen), 0);
+      if (k < spanH) spanWork.set(bankB.subarray(atStart + k * rowLen, yEnd * rowLen), k * rowLen);
+      llFreq.fill(0); dFreq.fill(0); llFreq[256] = 1;
+      const st = parseSlice(null, 0, spanWork, spanBytes, llFreq, dFreq, false);
+      return entropyBits(llFreq, dFreq, 1 + st.llTot, st.dTot, st.extra);
     };
 
     let bestY = yMid;
-    let bestC = evalSplit(yMid, 2);
-    for (let y = yStart + 4; y <= yEnd - 4; y += 6) {
+    let bestC = evalSplit(yMid);
+    for (let y = yStart + 4; y <= yEnd - 4; y += 5) {
       if (y === yMid) continue;
-      const c = evalSplit(y, 2);
+      const c = evalSplit(y);
       if (c < bestC) { bestC = c; bestY = y; }
     }
-    let center = bestY;
-    bestC = evalSplit(bestY, 2);
-    for (let y = Math.max(yStart + 2, center - 4); y <= Math.min(yEnd - 2, center + 4); y += 2) {
-      if (y === bestY) continue;
-      const c = evalSplit(y, 2);
-      if (c < bestC) { bestC = c; bestY = y; }
-    }
-    center = bestY;
-    for (const dy of [-1, 1]) {
+    const center = bestY;
+    for (const dy of [-2, -1, 1, 2]) {
       const y = center + dy;
       if (y > yStart && y < yEnd) {
-        const c = evalSplit(y, 2);
+        const c = evalSplit(y);
         if (c < bestC) { bestC = c; bestY = y; }
       }
     }
@@ -451,33 +750,6 @@ function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, leve
       if (k < spanH) out.set(bankB.subarray(atStart + k * rowLen, yEnd * rowLen), atStart + k * rowLen);
       sA.y1 = bestY;
       sB.y0 = bestY;
-    }
-  }
-
-  // Bidirectional segment-mode re-check at level 3 (capped to <=420 KiB for fast screening!)
-  if (doBidir && segs.length >= 2) {
-    const padRows = Math.min(12, Math.max(4, Math.floor(12288 / rowLen)));
-    for (let si = 0; si < segs.length; si++) {
-      const seg = segs[si];
-      if (seg.y1 <= seg.y0) continue;
-      const wStart = Math.max(0, seg.y0 - padRows);
-      const wEnd = Math.min(h, seg.y1 + padRows);
-      const wBytes = (wEnd - wStart) * rowLen;
-      if (wBytes > 420 * 1024) continue;
-      const buf = out.subarray(wStart * rowLen, wEnd * rowLen).slice();
-      const segOff = (seg.y0 - wStart) * rowLen;
-      let bestM = seg.mode;
-      let bestC = deflateSync(buf, { level: 3, memLevel: 8, strategy }).length;
-      for (let m = 0; m < numModes; m++) {
-        if (m === seg.mode || m === 3) continue;
-        buf.set(rowBank[m].subarray(seg.y0 * rowLen, seg.y1 * rowLen), segOff);
-        const c = deflateSync(buf, { level: 3, memLevel: 8, strategy }).length;
-        if (c + 4 < bestC) { bestC = c; bestM = m; }
-      }
-      if (bestM !== seg.mode) {
-        seg.mode = bestM;
-        out.set(rowBank[bestM].subarray(seg.y0 * rowLen, seg.y1 * rowLen), seg.y0 * rowLen);
-      }
     }
   }
   return out;
@@ -539,11 +811,10 @@ export function screenCandidates(rgba, width, height, topK = 2) {
     }
 
     const bank = buildRowBank(form.samples, width, height, form.bpp, false);
-    if (form.bpp <= 2) {
-      const bruteBuf = new Uint8Array(size);
-      filterZlibBrute(bank, width, height, form.bpp, bruteBuf, 3, 24576);
-      bank.push(bruteBuf);
-    }
+    // Pure-JS zero-syscall per-row LZ+entropy filter (replaces slow 3,600-syscall filterZlibBrute!)
+    const lzRowBuf = new Uint8Array(size);
+    filterLzRow(bank, width, height, form.bpp, lzRowBuf);
+    bank.push(lzRowBuf);
 
     // Fast deterministic density probe on Paeth to avoid slow level-6 screening on huge noisy photos (>220 KB)
     let isHuge = false;
@@ -557,18 +828,21 @@ export function screenCandidates(rgba, width, height, topK = 2) {
     }
 
     const screenOpt = isHuge ? SCREEN_FAST : SCREEN_DEF;
-    const names = ['0', '1', '2', '3', '4', 'pairs', 'minsum', 'brute'];
+    const names = ['0', '1', '2', '3', '4', 'pairs', 'minsum', 'lzrow'];
     for (let m = 0; m < bank.length; m++) {
       if (isHuge && (m === 4 || m === 3)) continue;
       const z = deflateSync(bank[m], screenOpt);
       consider(form, names[m], bank[m], z, z.length + chunks, false);
     }
 
-    const buf = new Uint8Array(size);
-    // Single fast 32-row hybrid banded pass (exact row boundary refinement + bidirectional re-check)
-    filterBandHybrid(bank, width, height, form.bpp, buf, 32, 32768, isHuge ? 3 : 4, constants.Z_DEFAULT_STRATEGY, 0, !isHuge);
-    const z32 = deflateSync(buf, screenOpt);
-    consider(form, 'band32', buf, z32, z32.length + chunks, true);
+    // Single fast pure-JS zero-syscall hybrid banded filter pass (skip on huge noisy photos where lzrow wins!)
+    if (!isHuge) {
+      const bh = form.bpp === 1 ? 24 : 40;
+      const buf = new Uint8Array(size);
+      filterBandPureJs(bank, width, height, form.bpp, buf, bh, 16);
+      const zb = deflateSync(buf, screenOpt);
+      consider(form, `band${bh}`, buf, zb, zb.length + chunks, true);
+    }
   }
 
   // Re-rank top 3 pool entries by min(z9_default, z9_filtered when dense)

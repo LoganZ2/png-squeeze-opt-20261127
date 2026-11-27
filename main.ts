@@ -37,11 +37,11 @@ function squeezePng(rgba, width, height) {
   const cand = screenCandidates(rgba, width, height, 1)[0];
   const rawLen = cand.data.length;
   const zLen = cand.zlib.length;
-  // Deterministic work budget calibrated for <=14.0s Mac / <=45s cloud 1-vCPU (~15s safety margin under 60s!)
+  // Deterministic work budget calibrated for <=13.5s Node 22 Mac (~32-38s cloud gVisor 1-vCPU, zero filter syscalls!)
   const isHugePhoto = zLen > 190_000;
   const isDense = zLen > 90_000;
-  const iters = isHugePhoto ? 4 : rawLen <= 1_200_000 ? 8 : isDense ? 7 : 6;
-  const chain = isHugePhoto ? 48 : rawLen <= 1_200_000 ? (isDense ? 192 : 208) : 128;
+  const iters = isHugePhoto ? 3 : rawLen <= 1_200_000 ? 7 : isDense ? 6 : 5;
+  const chain = isHugePhoto ? 40 : rawLen <= 1_200_000 ? 192 : 128;
   const idat = bestZlibForCandidate(cand, width, iters, chain);
   return pngOfForm(width, height, cand.form, idat);
 }

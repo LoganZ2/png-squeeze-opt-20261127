@@ -772,7 +772,7 @@ function splitInputBlocks(data, runLeft, runBpp, runRow, rowStride, bpp, maxBloc
   const n = data.length;
   if (n <= 4096) return [0, n];
 
-  const lz = fastLazyLZ77(data, runLeft, runBpp, runRow, rowStride, bpp, 48);
+  const lz = fastLazyLZ77(data, runLeft, runBpp, runRow, rowStride, bpp, 36);
   const splits = splitTokenStream(lz.litLens, lz.dists, lz.count, maxBlocks, 256);
 
   const byteBounds = [0];
@@ -1267,8 +1267,8 @@ function zopfliOptimizeRange(
     }
   }
 
-  // Bonus exact-Huffman continuation pass only on fast 1-bpp images!
-  if (lastImproved && bestDyn !== null && iterations >= 6 && data.length <= 1_200_000) {
+  // Bonus exact-Huffman continuation pass only when high iteration budget is requested!
+  if (lastImproved && bestDyn !== null && iterations >= 8 && data.length <= 1_200_000) {
     for (let i = 0; i < 286; i++) llCost[i] = bestDyn.llLens[i] > 0 ? bestDyn.llLens[i] : 16;
     for (let i = 0; i < 30; i++) dCost[i] = bestDyn.dLens[i] > 0 ? bestDyn.dLens[i] : 16;
     const { litLens, dists, posArr, tokCnt } = optimalParseBlock(
@@ -1336,7 +1336,7 @@ export function zopfliZlib(data, { iterations = 13, maxChain = 448, maxBlocks = 
           const rawStart = res.posArr[ts];
           const rawEnd = te < res.tokCnt ? res.posArr[te] : bEnd;
           const initSub = { litLens: res.litLens.subarray(ts, te), dists: res.dists.subarray(ts, te) };
-          if (data.length > 1_200_000 || iterations <= 7) {
+          if (data.length > 1_200_000 || iterations <= 6) {
             finalBlocks.push({ litLens: initSub.litLens, dists: initSub.dists, rawStart, rawEnd });
           } else {
             const reopt = zopfliOptimizeRange(
