@@ -46,6 +46,16 @@ export function fastZopfliScreenWasm(data, rowStride = 0, bpp = 1) {
   }
 }
 
+export function scoutZopfliSizeWasm(data, rowStride = 0, bpp = 1) {
+  const inLen = data.length;
+  const inPtr = copyToWasm(data);
+  try {
+    return wasm.scout_zopfli_size(inPtr, inLen, rowStride, bpp) >>> 0;
+  } finally {
+    wasm.dealloc(inPtr, inLen);
+  }
+}
+
 export function fastLzLiteralCounts(data, rowStride = 0) {
   const inLen = data.length;
   const inPtr = copyToWasm(data);

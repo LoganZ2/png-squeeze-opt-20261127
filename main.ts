@@ -36,12 +36,24 @@ function squeezePng(rgba, width, height) {
   const top0 = finalists[0];
   const rawLen = top0.data.length;
   const zLen = top0.estBytes;
-  const isMegaImg = rawLen > 4_200_000 || zLen > 400_000;
-  const isHugePhoto = zLen > 220_000;
+  const isMegaImg = rawLen > 4_200_000 || zLen > 380_000;
+  const isHugePhoto = zLen > 205_000;
   const isDense = zLen > 90_000;
 
-  // High-power SIMD128 Rust/WASM deterministic Zopfli budgets calibrated for <=13.4s Node 22 Mac (~30s cloud!)
-  const iters0 = isMegaImg ? 3 : isHugePhoto ? 4 : rawLen <= 1_200_000 ? 10 : zLen > 135_000 ? 8 : isDense ? 9 : 7;
+  // High-power SIMD128 Rust/WASM deterministic Zopfli budgets calibrated for <=14.2s Node 22 Mac (<30s cloud!)
+  const iters0 = isMegaImg
+    ? 3
+    : isHugePhoto
+      ? 4
+      : zLen > 135_000
+        ? 7
+        : isDense
+          ? rawLen <= 1_200_000
+            ? 12
+            : 9
+          : rawLen <= 1_200_000
+            ? 9
+            : 6;
   const chain0 = isMegaImg ? 32 : isHugePhoto ? 48 : rawLen <= 1_200_000 ? 448 : isDense ? 208 : 448;
   const blocks0 = isMegaImg ? 16 : 32;
 

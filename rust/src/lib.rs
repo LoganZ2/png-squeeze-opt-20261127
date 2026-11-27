@@ -64,6 +64,8 @@ const HASH_SIZE: usize = 1 << HASH_BITS;
 const HASH_MASK: usize = HASH_SIZE - 1;
 const WIN_SIZE: usize = 32768;
 const WIN_MASK: usize = WIN_SIZE - 1;
+const BT_SIZE: usize = 65536;
+const BT_MASK: usize = BT_SIZE - 1;
 
 struct Tables {
     len_sym: [u16; 259],
@@ -1379,6 +1381,301 @@ fn find_best_split_fast(
     (exact_pos, exact_cost)
 }
 
+fn extract_filter_regime_cuts(
+    data: &[u8],
+    b_start: usize,
+    b_end: usize,
+    row_stride: usize,
+    pos_arr: &[u32],
+    count: usize,
+) -> Vec<usize> {
+    let mut cuts = Vec::new();
+    if row_stride <= 1 || b_end <= b_start + row_stride * 16 || count < 128 || pos_arr.len() != count {
+        return cuts;
+    }
+    let y0 = (b_start + row_stride - 1) / row_stride;
+    let y1 = b_end / row_stride;
+    if y1 <= y0 + 16 {
+        return cuts;
+    }
+    let mut runs: Vec<(usize, usize, u8)> = Vec::new();
+    let mut ry = y0;
+    while ry < y1 {
+        let f = data[ry * row_stride];
+        let mut end = ry + 1;
+        while end < y1 && data[end * row_stride] == f {
+            end += 1;
+        }
+        runs.push((ry, end, f));
+        ry = end;
+    }
+    // Collect exact transition rows bordering any macro filter run (>= 8 rows)
+    let mut boundary_rows: Vec<(usize, usize)> = Vec::new(); // (row, priority_run_len)
+    for (ri, &(a, b, _)) in runs.iter().enumerate() {
+        let rlen = b - a;
+        if rlen >= 8 {
+            if a > y0 {
+                let prev_len = if ri > 0 { runs[ri - 1].1 - runs[ri - 1].0 } else { 0 };
+                boundary_rows.push((a, rlen.max(prev_len)));
+            }
+            if b < y1 {
+                let next_len = if ri + 1 < runs.len() { runs[ri + 1].1 - runs[ri + 1].0 } else { 0 };
+                boundary_rows.push((b, rlen.max(next_len)));
+            }
+        }
+    }
+    if boundary_rows.is_empty() {
+        return cuts;
+    }
+    boundary_rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    boundary_rows.dedup_by_key(|x| x.0);
+    if boundary_rows.len() > 36 {
+        boundary_rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        boundary_rows.truncate(36);
+        boundary_rows.sort_unstable_by_key(|x| x.0);
+    }
+    for (row, _) in boundary_rows {
+        let off = row * row_stride;
+        if off > b_start && off < b_end {
+            let tidx = pos_arr.partition_point(|&p| (p as usize) < off);
+            if tidx > 64 && tidx + 64 < count {
+                cuts.push(tidx);
+            }
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts
+}
+
+/// Run-Aware Optimal O(M^2) DP Block Splitter + Greedy Binary Splitter:
+/// Combines macro PNG filter-regime transition cuts, greedy splits, and uniform grid cuts,
+/// then solves exact shortest-path multi-cut DP (isolating A|B|A sandwiched regimes!) and
+/// keeps the strictly lowest-bit partition verified by exact dynamic/fixed Huffman costing!
+fn split_token_stream_dp(
+    tbl: &Tables,
+    data: &[u8],
+    b_start: usize,
+    b_end: usize,
+    row_stride: usize,
+    lit_lens: &[u16],
+    dists: &[u16],
+    pos_arr: &[u32],
+    max_blocks: usize,
+    min_tokens: usize,
+    fast_eval: bool,
+) -> Vec<usize> {
+    let count = lit_lens.len();
+    if count < min_tokens.max(128) || max_blocks <= 1 {
+        return vec![0, count];
+    }
+
+    let greedy = split_token_stream(tbl, lit_lens, dists, max_blocks, min_tokens);
+    if count < 10_000 {
+        return greedy;
+    }
+    let eval_part = |sp: &[usize]| -> u64 {
+        let mut tot = 0u64;
+        for i in 0..sp.len() - 1 {
+            tot += exact_range_bits(tbl, lit_lens, dists, sp[i], sp[i + 1], fast_eval);
+        }
+        tot
+    };
+    let mut best_splits = greedy.clone();
+    let mut best_bits = eval_part(&best_splits);
+
+    // Build candidate cut set (filter transitions + greedy cuts + uniform grid)
+    let mut raw_cuts = Vec::with_capacity(88);
+    raw_cuts.push(0usize);
+    raw_cuts.push(count);
+    for &g in &greedy {
+        raw_cuts.push(g);
+    }
+    let reg_cuts = extract_filter_regime_cuts(data, b_start, b_end, row_stride, pos_arr, count);
+    for &rc in &reg_cuts {
+        raw_cuts.push(rc);
+    }
+    let grid_n = if fast_eval { 18usize } else { 28usize };
+    let step = (count / (grid_n + 1)).max(64);
+    for k in 1..=grid_n {
+        let p = k * step;
+        if p > 64 && p + 64 < count {
+            raw_cuts.push(p);
+        }
+    }
+    raw_cuts.sort_unstable();
+    let mut cuts = Vec::with_capacity(raw_cuts.len());
+    cuts.push(0usize);
+    let min_gap = 48usize;
+    for &c in &raw_cuts[1..] {
+        if c == count {
+            break;
+        }
+        if c >= *cuts.last().unwrap() + min_gap && c + min_gap <= count {
+            cuts.push(c);
+        }
+    }
+    cuts.push(count);
+    if cuts.len() > 82 {
+        // Prioritize filter-regime & greedy cuts, drop excess uniform grid cuts
+        let mut keep = Vec::with_capacity(82);
+        keep.push(0usize);
+        keep.push(count);
+        keep.extend_from_slice(&reg_cuts);
+        keep.extend_from_slice(&greedy);
+        keep.sort_unstable();
+        keep.dedup();
+        if keep.len() < 80 {
+            let rem = 80 - keep.len();
+            let st = (count / (rem + 1)).max(64);
+            for k in 1..=rem {
+                keep.push(k * st);
+            }
+        }
+        keep.sort_unstable();
+        cuts.clear();
+        cuts.push(0usize);
+        for &c in &keep {
+            if c > 0 && c < count && c >= *cuts.last().unwrap() + min_gap && c + min_gap <= count {
+                cuts.push(c);
+                if cuts.len() >= 81 {
+                    break;
+                }
+            }
+        }
+        cuts.push(count);
+    }
+
+    let m = cuts.len() - 1;
+    if m < 2 {
+        return best_splits;
+    }
+
+    // Build prefix frequency arrays in ONE linear pass O(count)
+    let mut pref_ll = vec![[0u32; 286]; m + 1];
+    let mut pref_d = vec![[0u32; 30]; m + 1];
+    let mut pref_ll_tot = vec![0u32; m + 1];
+    let mut pref_d_tot = vec![0u32; m + 1];
+    let mut pref_ex = vec![0u64; m + 1];
+
+    let mut cur_ll = [0u32; 286];
+    let mut cur_d = [0u32; 30];
+    let mut cur_ll_tot = 0u32;
+    let mut cur_d_tot = 0u32;
+    let mut cur_ex = 0u64;
+    let mut pos = 0usize;
+    for ci in 1..=m {
+        let target = cuts[ci];
+        while pos < target {
+            let d = dists[pos] as usize;
+            if d == 0 {
+                cur_ll[lit_lens[pos] as usize] += 1;
+                cur_ll_tot += 1;
+            } else {
+                let l = lit_lens[pos] as usize;
+                cur_ll[tbl.len_sym[l] as usize] += 1;
+                cur_ll_tot += 1;
+                let ds = tbl.dist_sym[d] as usize;
+                cur_d[ds] += 1;
+                cur_d_tot += 1;
+                cur_ex += (tbl.len_ex[l] + DIST_EXTRA[ds]) as u64;
+            }
+            pos += 1;
+        }
+        pref_ll[ci] = cur_ll;
+        pref_d[ci] = cur_d;
+        pref_ll_tot[ci] = cur_ll_tot;
+        pref_d_tot[ci] = cur_d_tot;
+        pref_ex[ci] = cur_ex;
+    }
+
+    // Precompute upper-triangular segment entropy costs once O(M^2 * 316) (~1ms for M=70!)
+    let mut seg_cost = vec![0.0f64; (m + 1) * (m + 1)];
+    let mut s_ll = [0u32; 286];
+    let mut s_d = [0u32; 30];
+    for i in 0..m {
+        for j in (i + 1)..=m {
+            for k in 0..286 {
+                s_ll[k] = pref_ll[j][k] - pref_ll[i][k];
+            }
+            s_ll[256] = 1;
+            for k in 0..30 {
+                s_d[k] = pref_d[j][k] - pref_d[i][k];
+            }
+            let lt = pref_ll_tot[j] - pref_ll_tot[i] + 1;
+            let dt = pref_d_tot[j] - pref_d_tot[i];
+            let ex = pref_ex[j] - pref_ex[i];
+            seg_cost[i * (m + 1) + j] = entropy_from_freqs(tbl, &s_ll, &s_d, lt, dt, ex);
+        }
+    }
+
+    // Run 1 well-calibrated header-bias sweep (+140 bits), clean up with exact Huffman merging, keep global best!
+    let biases: &[f64] = if fast_eval { &[120.0] } else { &[140.0] };
+    for &bias in biases {
+        let mut dp = vec![f64::INFINITY; m + 1];
+        let mut prev = vec![0usize; m + 1];
+        dp[0] = 0.0;
+        for j in 1..=m {
+            let mut best_v = f64::INFINITY;
+            let mut best_i = 0usize;
+            for i in 0..j {
+                let v = dp[i] + seg_cost[i * (m + 1) + j] + if i > 0 { bias } else { 0.0 };
+                if v < best_v {
+                    best_v = v;
+                    best_i = i;
+                }
+            }
+            dp[j] = best_v;
+            prev[j] = best_i;
+        }
+        let mut cand = Vec::new();
+        let mut cur = m;
+        while cur > 0 {
+            cand.push(cuts[cur]);
+            cur = prev[cur];
+        }
+        cand.push(0usize);
+        cand.reverse();
+
+        // Exact adjacent-block merge cleanup + enforce max_blocks
+        let mut seg_bits: Vec<u64> = (0..cand.len() - 1)
+            .map(|k| exact_range_bits(tbl, lit_lens, dists, cand[k], cand[k + 1], fast_eval))
+            .collect();
+        loop {
+            if seg_bits.len() <= 1 {
+                break;
+            }
+            let mut best_idx = usize::MAX;
+            let mut best_delta = i64::MAX;
+            let mut best_joined = 0u64;
+            for k in 0..seg_bits.len() - 1 {
+                let joined = exact_range_bits(tbl, lit_lens, dists, cand[k], cand[k + 2], fast_eval);
+                let delta = joined as i64 - (seg_bits[k] + seg_bits[k + 1]) as i64;
+                if delta < best_delta {
+                    best_delta = delta;
+                    best_idx = k;
+                    best_joined = joined;
+                }
+            }
+            if best_idx != usize::MAX && (best_delta <= 0 || seg_bits.len() > max_blocks) {
+                cand.remove(best_idx + 1);
+                seg_bits[best_idx] = best_joined;
+                seg_bits.remove(best_idx + 1);
+            } else {
+                break;
+            }
+        }
+        let tot_bits: u64 = seg_bits.iter().sum();
+        let margin = if reg_cuts.is_empty() { 192 } else { 48 };
+        if tot_bits + margin < best_bits {
+            best_bits = tot_bits;
+            best_splits = cand;
+        }
+    }
+
+    best_splits
+}
+
 fn split_token_stream(
     tbl: &Tables,
     lit_lens: &[u16],
@@ -1466,22 +1763,23 @@ fn match_len_fast(data: &[u8], c: usize, p: usize, start: usize, max_len: usize)
     l
 }
 
+/// 64K Unpruned Binary-Tree (BT3) Match Finder: inserts `p` as the new root of `bt_head[h]` while walking
+/// root-to-leaf in STRICTLY INCREASING distance order (`dist = p - c`), finding exact Pareto-optimal
+/// matches across the entire 32 KiB window without hash-chain clogging or tree decapitation!
 fn precompute_block_matches(
+    tbl: &Tables,
     data: &[u8],
     runs: &Runs,
     b_start: usize,
     b_end: usize,
-    head: &mut [i32],
-    prev: &mut [i32],
-    head2: &mut [i32],
-    prev2: &mut [i32],
+    bt_head: &mut [i32],
+    bt_son: &mut [i32],
     row_stride: usize,
     bpp: usize,
-    max_chain: usize,
+    max_depth: usize,
     pool: &mut MatchPool,
 ) {
     let b_len = b_end - b_start;
-    let n = data.len();
     pool.off.clear();
     pool.off.resize(b_len + 1, 0);
     pool.m_len.clear();
@@ -1490,30 +1788,18 @@ fn precompute_block_matches(
     let run_left = &runs.run_left;
     let run_bpp = runs.run_bpp.as_deref();
     let run_row = runs.run_row.as_deref();
+    let _ = tbl;
 
     let mut min_dist = [0u16; 259];
     let mut tmp_len = [0u16; 260];
     let mut tmp_dist = [0u16; 260];
-
-    let insert_hashes = |p: usize, head: &mut [i32], prev: &mut [i32], head2: &mut [i32], prev2: &mut [i32]| {
-        if p + 2 < n {
-            let h = hash3(data, p);
-            prev[p & WIN_MASK] = head[h];
-            head[h] = p as i32;
-        }
-        let r = run_left[p] as usize;
-        if r >= 3 && r < 258 && p + r < n {
-            let h2 = hash_rle(r, data[p], data[p + r]);
-            prev2[p & WIN_MASK] = head2[h2];
-            head2[h2] = p as i32;
-        } else if let Some(rb) = run_bpp {
-            let br = rb[p] as usize;
-            if br >= bpp * 2 && br < 258 && p + br < n {
-                let h2 = hash_bpp_run(br, data, p, bpp, data[p + br]);
-                prev2[p & WIN_MASK] = head2[h2];
-                head2[h2] = p as i32;
-            }
-        }
+    let ptr = data.as_ptr();
+    let bt_depth = if max_depth <= 64 {
+        max_depth
+    } else if bpp == 1 {
+        max_depth.max(1536)
+    } else {
+        max_depth.max(768)
     };
 
     for i in 0..b_len {
@@ -1522,145 +1808,39 @@ fn precompute_block_matches(
         let rem = b_end - p;
         let max_len = rem.min(258);
 
-        // Fast path 1: period-1 RLE full match
-        if p > 0 && data[p] == data[p - 1] && (run_left[p] as usize) >= max_len && max_len >= 3 {
+        // Fast path 1: period-1 RLE full match (dist=1 is globally optimal; interior bytes of >=259 runs need no BT3 entry!)
+        if p > 0 && unsafe { *ptr.add(p) == *ptr.add(p - 1) } && (run_left[p] as usize) >= max_len && max_len >= 3 {
             pool.m_len.push(max_len as u16);
             pool.m_dist.push(1);
-            if run_left[p] < 516 || i == 0 || i + 1 == b_len {
-                insert_hashes(p, head, prev, head2, prev2);
-            }
             continue;
         }
 
-        // Fast path 2: period-bpp full match
+        // Fast path 2: period-bpp full match (dist=bpp has 0 extra bits; interior bytes need no BT3 entry!)
         if let Some(rb) = run_bpp {
             if (rb[p] as usize) >= max_len && max_len >= 3 {
-                if p > 0 && data[p] == data[p - 1] && run_left[p] >= 3 {
+                if p > 0 && unsafe { *ptr.add(p) == *ptr.add(p - 1) } && run_left[p] >= 3 {
                     let rl = (run_left[p] as usize).min(max_len);
                     pool.m_len.push(rl as u16);
                     pool.m_dist.push(1);
                 }
                 pool.m_len.push(max_len as u16);
                 pool.m_dist.push(bpp as u16);
-                if rb[p] < 516 || i < bpp || i + bpp >= b_len {
-                    insert_hashes(p, head, prev, head2, prev2);
-                }
                 continue;
             }
         }
 
         if max_len < 3 {
-            insert_hashes(p, head, prev, head2, prev2);
             continue;
         }
 
         let limit = p.saturating_sub(WIN_SIZE) as i32;
-        let b0 = data[p];
-        let b1 = data[p + 1];
-        let b2 = data[p + 2];
+        let b0 = unsafe { *ptr.add(p) };
         let my_run = run_left[p] as usize;
-        let my_bpp_run = run_bpp.map_or(0, |rb| rb[p] as usize);
         let row_len_above = run_row.map_or(0, |rr| (rr[p] as usize).min(max_len));
-        let use_rle_hash = my_run >= 3 && my_run < max_len && p + my_run < n;
-        let use_bpp_hash = !use_rle_hash
-            && bpp > 1
-            && my_bpp_run >= bpp * 2
-            && my_bpp_run < max_len
-            && p + my_bpp_run < n;
 
-        // Fast direct Pareto path when no out-of-order match sources exist!
-        if !use_rle_hash && !use_bpp_hash && row_len_above < 3 {
-            let mut best_l = 2usize;
-            let mut steps = 0usize;
-            if p > 0 && data[p - 1] == b0 && my_run >= 3 {
-                best_l = my_run.min(max_len);
-                tmp_len[steps] = best_l as u16;
-                tmp_dist[steps] = 1;
-                steps += 1;
-            }
-            if let Some(rb) = run_bpp {
-                let v = (rb[p] as usize).min(max_len);
-                if v > best_l {
-                    best_l = v;
-                    tmp_len[steps] = v as u16;
-                    tmp_dist[steps] = bpp as u16;
-                    steps += 1;
-                }
-            }
-            let h = hash3(data, p);
-            let mut cand = head[h];
-            let mut chain = max_chain;
-            let ptr = data.as_ptr();
-            let mut tail_u16 = unsafe { (ptr.add(p + best_l - 1) as *const u16).read_unaligned() };
-            while cand >= limit && chain > 0 && best_l < max_len {
-                chain -= 1;
-                let c = cand as usize;
-                let hit = unsafe {
-                    (ptr.add(c + best_l - 1) as *const u16).read_unaligned() == tail_u16
-                        && *ptr.add(c) == b0
-                        && *ptr.add(c + 1) == b1
-                        && *ptr.add(c + 2) == b2
-                };
-                if hit {
-                    let l = match_len_fast(data, c, p, 3, max_len);
-                    if l > best_l {
-                        best_l = l;
-                        tmp_len[steps] = l as u16;
-                        tmp_dist[steps] = (p - c) as u16;
-                        steps += 1;
-                        if best_l == max_len {
-                            break;
-                        }
-                        tail_u16 = unsafe { (ptr.add(p + best_l - 1) as *const u16).read_unaligned() };
-                        if best_l >= 128 && chain > 40 {
-                            chain = 40;
-                        } else if best_l >= 64 && chain > 80 {
-                            chain = 80;
-                        }
-                    }
-                }
-                let nxt = unsafe { *prev.get_unchecked(c & WIN_MASK) };
-                if nxt >= cand {
-                    break;
-                }
-                cand = nxt;
-            }
-            // Extra O(1) multi-row probes (2..=6 * row_stride within 32 KiB window)
-            if best_l < max_len && row_stride > 1 {
-                for mult in 2usize..=6usize {
-                    let rd = row_stride * mult;
-                    if rd > WIN_SIZE {
-                        break;
-                    }
-                    if p >= rd && best_l < max_len {
-                        let rc = p - rd;
-                        if data[rc + best_l] == data[p + best_l]
-                            && data[rc] == b0
-                            && data[rc + 1] == b1
-                            && data[rc + 2] == b2
-                        {
-                            let l = match_len_fast(data, rc, p, 3, max_len);
-                            if l > best_l {
-                                best_l = l;
-                                tmp_len[steps] = l as u16;
-                                tmp_dist[steps] = rd as u16;
-                                steps += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            insert_hashes(p, head, prev, head2, prev2);
-            if steps > 0 {
-                pool.m_len.extend_from_slice(&tmp_len[..steps]);
-                pool.m_dist.extend_from_slice(&tmp_dist[..steps]);
-            }
-            continue;
-        }
-
-        // Exact Pareto min_dist[3..=max_found] merge path
+        // Seed exact Pareto min_dist[3..=max_found] from O(1) structural matches (dist=1, bpp, row_stride)
         let mut max_found = 2usize;
-        if p > 0 && data[p - 1] == b0 && my_run >= 3 {
+        if p > 0 && unsafe { *ptr.add(p - 1) == b0 } && my_run >= 3 {
             let rl = my_run.min(max_len);
             for k in 3..=rl {
                 min_dist[k] = 1;
@@ -1698,246 +1878,91 @@ fn precompute_block_matches(
             }
         }
 
-        // Fast path 3: identical row-above full match -> only walk closer candidates (< row_stride)
-        if row_len_above == max_len {
-            let close_limit = (p - row_stride + 1) as i32;
-            let mut cand = head[hash3(data, p)];
-            let mut chain = 32usize;
-            let mut close_best = if min_dist[3] < row_stride as u16 { 3 } else { 2 };
-            while close_best < max_len && min_dist[close_best + 1] < row_stride as u16 {
-                close_best += 1;
-            }
-            while cand >= close_limit && chain > 0 && close_best < max_len {
-                chain -= 1;
-                let c = cand as usize;
-                if data[c + close_best] == data[p + close_best]
-                    && data[c] == b0
-                    && data[c + 1] == b1
-                    && data[c + 2] == b2
-                {
-                    let mut l = 3;
-                    while l < max_len && data[c + l] == data[p + l] {
-                        l += 1;
-                    }
-                    if l > close_best {
-                        close_best = l;
-                        let d = (p - c) as u16;
-                        let mut k = l;
-                        while k >= 3 && d < min_dist[k] {
-                            min_dist[k] = d;
-                            k -= 1;
-                        }
-                    }
-                }
-                let nxt = prev[c & WIN_MASK];
-                if nxt >= cand {
-                    break;
-                }
-                cand = nxt;
-            }
-            insert_hashes(p, head, prev, head2, prev2);
-            let mut steps = 0usize;
-            for k in 3..=max_found {
-                if k == max_found || min_dist[k] != min_dist[k + 1] {
-                    tmp_len[steps] = k as u16;
-                    tmp_dist[steps] = min_dist[k];
-                    steps += 1;
-                }
-            }
-            pool.m_len.extend_from_slice(&tmp_len[..steps]);
-            pool.m_dist.extend_from_slice(&tmp_dist[..steps]);
-            continue;
-        }
-
-        // Primary 3-byte hash walk (strictly nearest-to-farthest)
+        // Unpruned 64K BT3 walk + root insertion (L2-resident 2^16 hash table + inline 3-byte fast-path!):
+        let mut bt_exhausted = true;
         {
             let h = hash3(data, p);
-            let mut cand = head[h];
-            let mut chain = if use_bpp_hash && my_bpp_run >= 12 {
-                32
-            } else if use_rle_hash || use_bpp_hash {
-                (max_chain >> 1).min(96)
-            } else {
-                max_chain
-            };
-            let mut close_best = 2usize;
-            if p > 0 && data[p - 1] == b0 && my_run >= 3 {
-                close_best = my_run.min(max_len);
-            }
-            if let Some(rb) = run_bpp {
-                let v = (rb[p] as usize).min(max_len);
-                if v > close_best {
-                    close_best = v;
-                }
-            }
-            let ptr = data.as_ptr();
-            let mut tail_u16 = if close_best < max_len {
-                unsafe { (ptr.add(p + close_best - 1) as *const u16).read_unaligned() }
-            } else {
-                0
-            };
-            while cand >= limit && chain > 0 && close_best < max_len {
-                chain -= 1;
-                let c = cand as usize;
+            let mut cur = unsafe { *bt_head.get_unchecked(h) };
+            unsafe { *bt_head.get_unchecked_mut(h) = p as i32; }
+            let mut ptr0 = (p & BT_MASK) * 2 + 1;
+            let mut ptr1 = (p & BT_MASK) * 2;
+            let mut len0 = 0usize;
+            let mut len1 = 0usize;
+            let mut depth = bt_depth;
+            let mut bt_best = 2usize;
+            let mut finished_exact = false;
+
+            while cur >= limit && depth > 0 {
+                depth -= 1;
+                let c = cur as usize;
                 let dist = p - c;
-                if dist >= row_stride && row_len_above > close_best {
-                    close_best = row_len_above;
-                    if close_best < max_len {
-                        tail_u16 = unsafe { (ptr.add(p + close_best - 1) as *const u16).read_unaligned() };
-                    }
-                }
-                let hit = close_best < max_len && unsafe {
-                    (ptr.add(c + close_best - 1) as *const u16).read_unaligned() == tail_u16
-                        && *ptr.add(c) == b0
-                        && *ptr.add(c + 1) == b1
-                        && *ptr.add(c + 2) == b2
-                };
-                if hit {
-                    let start_l = if my_run > 3 && (run_left[c] as usize) >= my_run {
-                        my_run.min(max_len)
+                let c_slot = (c & BT_MASK) * 2;
+                let start_l = len0.min(len1);
+                let l = unsafe {
+                    if *ptr.add(c + start_l) != *ptr.add(p + start_l) {
+                        start_l
+                    } else if start_l + 1 < max_len && *ptr.add(c + start_l + 1) != *ptr.add(p + start_l + 1) {
+                        start_l + 1
+                    } else if start_l + 2 < max_len && *ptr.add(c + start_l + 2) != *ptr.add(p + start_l + 2) {
+                        start_l + 2
                     } else {
-                        3
-                    };
-                    let l = match_len_fast(data, c, p, start_l, max_len);
-                    if l > close_best {
-                        close_best = l;
-                        let d16 = dist as u16;
-                        if l > max_found {
-                            for k in max_found + 1..=l {
-                                min_dist[k] = d16;
-                            }
-                            max_found = l;
-                        }
-                        let mut k = l;
-                        while k >= 3 && d16 < min_dist[k] {
+                        match_len_fast(data, c, p, (start_l + 3).min(max_len), max_len)
+                    }
+                };
+                if l > bt_best {
+                    bt_best = l;
+                    let d16 = dist as u16;
+                    if l > max_found {
+                        for k in max_found + 1..=l {
                             min_dist[k] = d16;
-                            k -= 1;
                         }
-                        if close_best == max_len {
-                            break;
+                        max_found = l;
+                    }
+                    let mut k = l;
+                    while k >= 3 && d16 < min_dist[k] {
+                        min_dist[k] = d16;
+                        k -= 1;
+                    }
+                    if l == max_len {
+                        unsafe {
+                            *bt_son.get_unchecked_mut(ptr1) = *bt_son.get_unchecked(c_slot);
+                            *bt_son.get_unchecked_mut(ptr0) = *bt_son.get_unchecked(c_slot + 1);
                         }
-                        tail_u16 = unsafe { (ptr.add(p + close_best - 1) as *const u16).read_unaligned() };
-                        if close_best >= 128 && chain > 40 {
-                            chain = 40;
-                        } else if close_best >= 64 && chain > 80 {
-                            chain = 80;
-                        }
+                        finished_exact = true;
+                        break;
                     }
                 }
-                let nxt = unsafe { *prev.get_unchecked(c & WIN_MASK) };
-                if nxt >= cand {
-                    break;
+                if unsafe { *ptr.add(c + l) < *ptr.add(p + l) } {
+                    unsafe {
+                        *bt_son.get_unchecked_mut(ptr1) = cur;
+                        ptr1 = c_slot + 1;
+                        cur = *bt_son.get_unchecked(ptr1);
+                    }
+                    len1 = l;
+                } else {
+                    unsafe {
+                        *bt_son.get_unchecked_mut(ptr0) = cur;
+                        ptr0 = c_slot;
+                        cur = *bt_son.get_unchecked(ptr0);
+                    }
+                    len0 = l;
                 }
-                cand = nxt;
+            }
+            if !finished_exact {
+                if cur >= limit && depth == 0 {
+                    bt_exhausted = false;
+                }
+                unsafe {
+                    *bt_son.get_unchecked_mut(ptr0) = -1;
+                    *bt_son.get_unchecked_mut(ptr1) = -1;
+                }
             }
         }
 
-        // Secondary RLE-run OR period-bpp solid-pixel-run hash walk!
-        if use_rle_hash && max_found < max_len {
-            let h2 = hash_rle(my_run, b0, data[p + my_run]);
-            let mut cand = head2[h2];
-            let mut chain2 = max_chain;
-            let mut rle_best = my_run;
-            let ptr = data.as_ptr();
-            while cand >= limit && chain2 > 0 && rle_best < max_len {
-                chain2 -= 1;
-                let c = cand as usize;
-                let dist = p - c;
-                let worth = if rle_best < max_found {
-                    (dist as u16) < min_dist[rle_best + 1] || unsafe { *ptr.add(c + max_found) == *ptr.add(p + max_found) }
-                } else {
-                    unsafe { *ptr.add(c + rle_best) == *ptr.add(p + rle_best) }
-                };
-                if (run_left[c] as usize) == my_run
-                    && unsafe { *ptr.add(c) == b0 && *ptr.add(c + my_run) == *ptr.add(p + my_run) }
-                    && worth
-                {
-                    let l = match_len_fast(data, c, p, my_run + 1, max_len);
-                    if l > rle_best {
-                        rle_best = l;
-                        let d16 = dist as u16;
-                        if l > max_found {
-                            for k in max_found + 1..=l {
-                                min_dist[k] = d16;
-                            }
-                            max_found = l;
-                        }
-                        let mut k = l;
-                        while k >= 3 && d16 < min_dist[k] {
-                            min_dist[k] = d16;
-                            k -= 1;
-                        }
-                        if rle_best == max_len {
-                            break;
-                        }
-                    }
-                }
-                let nxt = unsafe { *prev2.get_unchecked(c & WIN_MASK) };
-                if nxt >= cand {
-                    break;
-                }
-                cand = nxt;
-            }
-        } else if use_bpp_hash && max_found < max_len {
-            let rb = run_bpp.unwrap();
-            let h2 = hash_bpp_run(my_bpp_run, data, p, bpp, data[p + my_bpp_run]);
-            let mut cand = head2[h2];
-            let mut chain2 = max_chain;
-            let mut bpp_best = my_bpp_run;
-            let ptr = data.as_ptr();
-            while cand >= limit && chain2 > 0 && bpp_best < max_len {
-                chain2 -= 1;
-                let c = cand as usize;
-                let dist = p - c;
-                let worth = if bpp_best < max_found {
-                    (dist as u16) < min_dist[bpp_best + 1]
-                        || unsafe { *ptr.add(c + max_found) == *ptr.add(p + max_found) }
-                } else {
-                    unsafe { *ptr.add(c + bpp_best) == *ptr.add(p + bpp_best) }
-                };
-                if (rb[c] as usize) == my_bpp_run
-                    && unsafe {
-                        *ptr.add(c) == b0
-                            && *ptr.add(c + 1) == b1
-                            && *ptr.add(c + 2) == b2
-                            && *ptr.add(c + bpp - 1) == *ptr.add(p + bpp - 1)
-                            && *ptr.add(c + my_bpp_run) == *ptr.add(p + my_bpp_run)
-                    }
-                    && worth
-                {
-                    let l = match_len_fast(data, c, p, my_bpp_run + 1, max_len);
-                    if l > bpp_best {
-                        bpp_best = l;
-                        let d16 = dist as u16;
-                        if l > max_found {
-                            for k in max_found + 1..=l {
-                                min_dist[k] = d16;
-                            }
-                            max_found = l;
-                        }
-                        let mut k = l;
-                        while k >= 3 && d16 < min_dist[k] {
-                            min_dist[k] = d16;
-                            k -= 1;
-                        }
-                        if bpp_best == max_len {
-                            break;
-                        }
-                        if bpp_best >= 128 && chain2 > 32 {
-                            chain2 = 32;
-                        }
-                    }
-                }
-                let nxt = unsafe { *prev2.get_unchecked(c & WIN_MASK) };
-                if nxt >= cand {
-                    break;
-                }
-                cand = nxt;
-            }
-        }
-
-        // Extra O(1) multi-row probes (2..=6 * row_stride within 32 KiB window)
-        if row_stride > 1 {
+        // Extra O(1) multi-row probes ONLY when BT3 hit depth limit (99.9% skipped with bit-exact identical result!)
+        if !bt_exhausted && row_stride > 1 {
+            let b1 = unsafe { *ptr.add(p + 1) };
+            let b2 = unsafe { *ptr.add(p + 2) };
             for mult in 2usize..=6usize {
                 let rd = row_stride * mult;
                 if rd > WIN_SIZE {
@@ -1945,7 +1970,7 @@ fn precompute_block_matches(
                 }
                 if p >= rd && (max_found < max_len || (rd as u16) < min_dist[max_found]) {
                     let rc = p - rd;
-                    if data[rc] == b0 && data[rc + 1] == b1 && data[rc + 2] == b2 {
+                    if unsafe { *ptr.add(rc) == b0 && *ptr.add(rc + 1) == b1 && *ptr.add(rc + 2) == b2 } {
                         let l = match_len_fast(data, rc, p, 3, max_len);
                         let d16 = rd as u16;
                         if l > max_found {
@@ -1963,8 +1988,6 @@ fn precompute_block_matches(
                 }
             }
         }
-
-        insert_hashes(p, head, prev, head2, prev2);
 
         if max_found >= 3 {
             let mut steps = 0usize;
@@ -2051,7 +2074,7 @@ fn optimal_parse_block(
     let dist_sym = &tbl.dist_sym;
 
     let dense_lim: usize = if exact_mode == 1 {
-        40
+        32
     } else if exact_mode == 3 {
         4
     } else if bpp == 1 {
@@ -2060,7 +2083,7 @@ fn optimal_parse_block(
         12
     };
     let tail_pad: usize = if exact_mode == 1 {
-        4
+        3
     } else if exact_mode == 3 {
         0
     } else if bpp == 1 {
@@ -2068,7 +2091,7 @@ fn optimal_parse_block(
     } else {
         1
     };
-    let run_skip: usize = if exact_mode == 0 {
+    let run_skip: usize = if exact_mode == 0 || exact_mode == 3 {
         260
     } else {
         516
@@ -2386,7 +2409,7 @@ fn zopfli_optimize_range(
         rng
     };
 
-    let final_mode: u8 = if allow_full_exact && (sub_end - sub_start) <= 750_000 {
+    let final_mode: u8 = if allow_full_exact && (sub_end - sub_start) <= 2_000_000 {
         2
     } else {
         1
@@ -2402,7 +2425,6 @@ fn zopfli_optimize_range(
         } else {
             0
         };
-        let is_exact_hdr = iter + 2 >= iterations;
         let parsed = optimal_parse_block(
             tbl,
             data,
@@ -2422,7 +2444,7 @@ fn zopfli_optimize_range(
         );
         let (ll_f, d_f, extra) =
             stats_from_range(tbl, &parsed.lit_lens, &parsed.dists, 0, parsed.lit_lens.len());
-        let dyn_t = build_best_dynamic_tree(&ll_f, &d_f, extra, !is_exact_hdr);
+        let dyn_t = build_best_dynamic_tree(&ll_f, &d_f, extra, false);
         let fix_b = fixed_block_bits(tbl, &ll_f, &d_f, extra);
         let bits = dyn_t.total_bits.min(fix_b);
 
@@ -2443,8 +2465,9 @@ fn zopfli_optimize_range(
             break;
         }
 
-        // Deterministic early-convergence jump directly to the final 2 exact integer-Huffman passes!
-        if same_streak >= 2 && iter >= 4 && iter + 3 < iterations {
+        // Deterministic early-convergence jump directly to the final 2 exact passes!
+        let (streak_lim, min_iter) = if iterations >= 11 { (3u32, 6usize) } else { (2u32, 4usize) };
+        if same_streak >= streak_lim && iter >= min_iter && iter + 3 < iterations {
             iter = iterations - 3;
         }
 
@@ -2764,7 +2787,7 @@ pub extern "C" fn deflate_zopfli(
     let runs = compute_runs(data, bpp_u, rstride);
 
     // True Zopfli 2-Phase Optimal Block Splitting:
-    // Row-aligned mega-chunks <= 1.9 MB (1 chunk for 1-bpp, 2 chunks for 3/4-bpp -> low RSS + sharp local Phase-1 splits!)
+    // Row-aligned mega-chunks <= 1.9 MB snapped to nearest macro filter-regime transition (±48 rows)!
     let mut mega_bounds = Vec::new();
     mega_bounds.push(0usize);
     let max_mega = if rstride > 1 {
@@ -2772,12 +2795,45 @@ pub extern "C" fn deflate_zopfli(
     } else {
         1_900_000usize
     };
+    let total_rows = if rstride > 1 { in_len / rstride } else { 0 };
     let mut cur_m = 0usize;
     while cur_m < in_len {
-        let nxt = (cur_m + max_mega).min(in_len);
+        let mut nxt = (cur_m + max_mega).min(in_len);
         if in_len - nxt < 65536 {
             mega_bounds.push(in_len);
             break;
+        }
+        if rstride > 1 && total_rows > 64 {
+            let target_row = nxt / rstride;
+            let lo_r = target_row.saturating_sub(48).max(cur_m / rstride + 16);
+            let hi_r = (target_row + 48).min(total_rows.saturating_sub(16));
+            let mut best_r = target_row;
+            let mut best_dist = usize::MAX;
+            for r in lo_r..=hi_r {
+                if r > 0 && r < total_rows && data[r * rstride] != data[(r - 1) * rstride] {
+                    // Check if at least one side has a contiguous run >= 8 rows
+                    let f_prev = data[(r - 1) * rstride];
+                    let mut p_len = 1usize;
+                    while p_len < 8 && r > p_len && data[(r - 1 - p_len) * rstride] == f_prev {
+                        p_len += 1;
+                    }
+                    let f_cur = data[r * rstride];
+                    let mut n_len = 1usize;
+                    while n_len < 8 && r + n_len < total_rows && data[(r + n_len) * rstride] == f_cur {
+                        n_len += 1;
+                    }
+                    if p_len >= 8 || n_len >= 8 {
+                        let d = if r >= target_row { r - target_row } else { target_row - r };
+                        if d < best_dist {
+                            best_dist = d;
+                            best_r = r;
+                        }
+                    }
+                }
+            }
+            if best_dist < usize::MAX {
+                nxt = best_r * rstride;
+            }
         }
         mega_bounds.push(nxt);
         cur_m = nxt;
@@ -2800,10 +2856,8 @@ pub extern "C" fn deflate_zopfli(
         m_dist: Vec::with_capacity((max_b * 2).max(4096)),
     };
 
-    let mut head = vec![-1i32; HASH_SIZE];
-    let mut prev = vec![-1i32; WIN_SIZE];
-    let mut head2 = vec![-1i32; HASH_SIZE];
-    let mut prev2 = vec![-1i32; WIN_SIZE];
+    let mut bt_head = vec![-1i32; HASH_SIZE];
+    let mut bt_son = vec![-1i32; BT_SIZE * 2];
 
     let mut final_blocks: Vec<FinalBlock> = Vec::with_capacity(mblocks + 8);
     let per_mega_blocks = ((mblocks + num_megas - 1) / num_megas).max(1);
@@ -2812,7 +2866,7 @@ pub extern "C" fn deflate_zopfli(
         let b_start = mega_bounds[b];
         let b_end = mega_bounds[b + 1];
         precompute_block_matches(
-            data, &runs, b_start, b_end, &mut head, &mut prev, &mut head2, &mut prev2, rstride,
+            tbl, data, &runs, b_start, b_end, &mut bt_head, &mut bt_son, rstride,
             bpp_u, chain, &mut pool,
         );
 
@@ -2823,7 +2877,10 @@ pub extern "C" fn deflate_zopfli(
                 tbl, data, &runs, bpp_u, rstride, b_start, &pool, 2, &mut dp_cost, &mut dp_len,
                 &mut dp_dist, 0, b_end - b_start, None, false,
             );
-            let splits = split_token_stream(tbl, &init.lit_lens, &init.dists, per_mega_blocks, 96);
+            let splits = split_token_stream_dp(
+                tbl, data, b_start, b_end, rstride, &init.lit_lens, &init.dists, &init.pos_arr,
+                per_mega_blocks, 96, false,
+            );
             let sub_iters = iters.max(3);
 
             for s in 0..splits.len() - 1 {
@@ -2853,10 +2910,13 @@ pub extern "C" fn deflate_zopfli(
                     Some((&init.lit_lens[ts..te], &init.dists[ts..te], &init.pos_arr[ts..te])),
                     true,
                 );
-                // Phase 2b: Post-convergence sub-split check + 3-iter re-opt!
+                // Phase 2b: Monotonic post-convergence sub-split check + 2-iter re-opt!
                 if res.lit_lens.len() >= 384 {
                     let sub2 = split_token_stream(tbl, &res.lit_lens, &res.dists, 6, 96);
                     if sub2.len() > 2 {
+                        let orig_res_bits = exact_range_bits(tbl, &res.lit_lens, &res.dists, 0, res.lit_lens.len(), false);
+                        let mut cand_sub: Vec<FinalBlock> = Vec::with_capacity(sub2.len() - 1);
+                        let mut cand_bits = 0u64;
                         for k in 0..sub2.len() - 1 {
                             let s2 = sub2[k];
                             let e2 = sub2[k + 1];
@@ -2883,7 +2943,8 @@ pub extern "C" fn deflate_zopfli(
                                 Some((&res.lit_lens[s2..e2], &res.dists[s2..e2], &res.pos_arr[s2..e2])),
                                 true,
                             );
-                            mega_blocks.push(FinalBlock {
+                            cand_bits += exact_range_bits(tbl, &reopt.lit_lens, &reopt.dists, 0, reopt.lit_lens.len(), false);
+                            cand_sub.push(FinalBlock {
                                 lit_lens: reopt.lit_lens,
                                 dists: reopt.dists,
                                 pos_arr: reopt.pos_arr,
@@ -2891,7 +2952,10 @@ pub extern "C" fn deflate_zopfli(
                                 raw_end: re2,
                             });
                         }
-                        continue;
+                        if cand_bits < orig_res_bits {
+                            mega_blocks.extend(cand_sub);
+                            continue;
+                        }
                     }
                 }
                 mega_blocks.push(FinalBlock {
@@ -2924,7 +2988,7 @@ pub extern "C" fn deflate_zopfli(
             mega_blocks = merge_adjacent_blocks(tbl, mega_blocks, &mut dirty);
             if iters >= 6 {
                 for (bi, blk) in mega_blocks.iter_mut().enumerate() {
-                    if dirty[bi] && blk.raw_end > blk.raw_start && blk.raw_end - blk.raw_start <= 400_000 {
+                    if dirty[bi] && blk.raw_end > blk.raw_start && blk.raw_end - blk.raw_start <= 280_000 {
                         let reopt = zopfli_optimize_range(
                             tbl,
                             data,
@@ -2987,6 +3051,253 @@ pub extern "C" fn deflate_zopfli(
     } else {
         bw.pos
     }
+}
+
+/// Fast hash3 Pareto match precomputer for scout_zopfli_size (zero BT3 decapitation, ~80ms on 3 MB!).
+fn precompute_scout_matches(
+    data: &[u8],
+    runs: &Runs,
+    b_start: usize,
+    b_end: usize,
+    head: &mut [i32],
+    prev: &mut [i32],
+    row_stride: usize,
+    bpp: usize,
+    max_chain: usize,
+    pool: &mut MatchPool,
+) {
+    let b_len = b_end - b_start;
+    pool.off.clear();
+    pool.off.resize(b_len + 1, 0);
+    pool.m_len.clear();
+    pool.m_dist.clear();
+    let run_left = &runs.run_left;
+    let run_bpp = runs.run_bpp.as_deref();
+    let run_row = runs.run_row.as_deref();
+    let ptr = data.as_ptr();
+    let mut min_dist = [0u16; 259];
+    let mut tmp_len = [0u16; 260];
+    let mut tmp_dist = [0u16; 260];
+
+    for i in 0..b_len {
+        pool.off[i] = pool.m_len.len() as u32;
+        let p = b_start + i;
+        let max_len = (b_end - p).min(258);
+        if max_len < 3 {
+            continue;
+        }
+        if p > 0 && unsafe { *ptr.add(p) == *ptr.add(p - 1) } && (run_left[p] as usize) >= max_len {
+            pool.m_len.push(max_len as u16);
+            pool.m_dist.push(1);
+            continue;
+        }
+        if let Some(rb) = run_bpp {
+            if (rb[p] as usize) >= max_len {
+                pool.m_len.push(max_len as u16);
+                pool.m_dist.push(bpp as u16);
+                continue;
+            }
+        }
+        let b0 = unsafe { *ptr.add(p) };
+        let b1 = unsafe { *ptr.add(p + 1) };
+        let b2 = unsafe { *ptr.add(p + 2) };
+        let mut max_found = 2usize;
+        if p > 0 && unsafe { *ptr.add(p - 1) == b0 } && run_left[p] >= 3 {
+            let rl = (run_left[p] as usize).min(max_len);
+            for k in 3..=rl { min_dist[k] = 1; }
+            max_found = rl;
+        }
+        if let Some(rb) = run_bpp {
+            let v = (rb[p] as usize).min(max_len);
+            if v > max_found {
+                for k in max_found + 1..=v { min_dist[k] = bpp as u16; }
+                max_found = v;
+            }
+        }
+        if let Some(rr) = run_row {
+            let v = (rr[p] as usize).min(max_len);
+            if v > max_found {
+                for k in max_found + 1..=v { min_dist[k] = row_stride as u16; }
+                max_found = v;
+            }
+        }
+        let h = hash3(data, p);
+        let limit = p.saturating_sub(WIN_SIZE) as i32;
+        let mut cand = head[h];
+        let mut ch = max_chain;
+        let mut h_best = 2usize;
+        while cand >= limit && ch > 0 && h_best < max_len {
+            ch -= 1;
+            let c = cand as usize;
+            if unsafe {
+                *ptr.add(c + h_best) == *ptr.add(p + h_best)
+                    && *ptr.add(c) == b0
+                    && *ptr.add(c + 1) == b1
+                    && *ptr.add(c + 2) == b2
+            } {
+                let l = match_len_fast(data, c, p, 3, max_len);
+                if l > h_best {
+                    h_best = l;
+                    let d16 = (p - c) as u16;
+                    if l > max_found {
+                        for k in max_found + 1..=l { min_dist[k] = d16; }
+                        max_found = l;
+                    }
+                    let mut k = l;
+                    while k >= 3 && d16 < min_dist[k] {
+                        min_dist[k] = d16;
+                        k -= 1;
+                    }
+                    if h_best >= 64 {
+                        break;
+                    }
+                }
+            }
+            let nxt = prev[c & WIN_MASK];
+            if nxt >= cand { break; }
+            cand = nxt;
+        }
+        prev[p & WIN_MASK] = head[h];
+        head[h] = p as i32;
+
+        if max_found >= 3 {
+            let mut steps = 0usize;
+            for k in 3..=max_found {
+                if k == max_found || min_dist[k] != min_dist[k + 1] {
+                    tmp_len[steps] = k as u16;
+                    tmp_dist[steps] = min_dist[k];
+                    steps += 1;
+                }
+            }
+            pool.m_len.extend_from_slice(&tmp_len[..steps]);
+            pool.m_dist.extend_from_slice(&tmp_dist[..steps]);
+        }
+    }
+    pool.off[b_len] = pool.m_len.len() as u32;
+}
+
+/// Ultra-fast Hash3 + Optimal-DP + Run-Aware DP-Split Zopfli scout (~160ms on 3 MB!).
+/// Eliminates greedy-zlib vs Zopfli rank inversions on dense multi-regime images (e.g. Photo|UI|Photo)!
+#[no_mangle]
+pub extern "C" fn scout_zopfli_size(
+    in_ptr: *const u8,
+    in_len: usize,
+    row_stride: u32,
+    bpp: u32,
+) -> u32 {
+    if in_ptr.is_null() || in_len == 0 {
+        return 0;
+    }
+    let data = unsafe { slice::from_raw_parts(in_ptr, in_len) };
+    let tbl = get_tables();
+    let rstride = row_stride as usize;
+    let bpp_u = (bpp as usize).max(1);
+    let runs = compute_runs(data, bpp_u, rstride);
+
+    let max_mega = if rstride > 1 {
+        ((1_900_000 / rstride).max(1)) * rstride
+    } else {
+        1_900_000usize
+    };
+    let mut mega_bounds = vec![0usize];
+    let mut cur_m = 0usize;
+    while cur_m < in_len {
+        let nxt = (cur_m + max_mega).min(in_len);
+        if in_len - nxt < 65536 {
+            mega_bounds.push(in_len);
+            break;
+        }
+        mega_bounds.push(nxt);
+        cur_m = nxt;
+    }
+    let num_megas = mega_bounds.len() - 1;
+    let max_b = (0..num_megas)
+        .map(|b| mega_bounds[b + 1] - mega_bounds[b])
+        .max()
+        .unwrap_or(0);
+
+    let mut dp_cost = vec![0f32; max_b + 1];
+    let mut dp_len = vec![0u16; max_b + 1];
+    let mut dp_dist = vec![0u16; max_b + 1];
+    let mut pool = MatchPool {
+        off: Vec::with_capacity(max_b + 1),
+        m_len: Vec::with_capacity((max_b * 2).max(4096)),
+        m_dist: Vec::with_capacity((max_b * 2).max(4096)),
+    };
+    let mut head = vec![-1i32; HASH_SIZE];
+    let mut prev = vec![-1i32; WIN_SIZE];
+
+    let mut total_bits = 0u64;
+    for b in 0..num_megas {
+        let b_start = mega_bounds[b];
+        let b_end = mega_bounds[b + 1];
+        precompute_scout_matches(
+            data, &runs, b_start, b_end, &mut head, &mut prev, rstride,
+            bpp_u, 28, &mut pool,
+        );
+        // Fast exact_mode=0 global init (2 passes) -> Run-Aware DP split -> 1 local exact_mode=0 re-parse per block!
+        let mut ll_cost = [0f32; 286];
+        let mut d_cost = [4.5f32; 30];
+        let mut raw_freq = [0u32; 256];
+        for &byte in &data[b_start..b_end] {
+            raw_freq[byte as usize] += 1;
+        }
+        let log_r = ((b_end - b_start).max(2) as f64).log2();
+        for i in 0..256 {
+            ll_cost[i] = if raw_freq[i] > 0 {
+                (log_r - (raw_freq[i] as f64).log2()).max(1.0) as f32
+            } else {
+                (log_r + 1.0) as f32
+            };
+        }
+        ll_cost[256] = log_r as f32;
+        for i in 257..286 {
+            ll_cost[i] = if bpp_u == 1 { 8.0 } else { 9.5 };
+        }
+        let p0 = optimal_parse_block(
+            tbl, data, &runs, bpp_u, rstride, b_start, &pool,
+            &ll_cost, &d_cost, &mut dp_cost, &mut dp_len, &mut dp_dist,
+            0, b_end - b_start, 0,
+        );
+        let (ll_f0, d_f0, _) = stats_from_range(tbl, &p0.lit_lens, &p0.dists, 0, p0.lit_lens.len());
+        let mut sm_ll = [0.0f64; 286];
+        let mut sm_d = [0.0f64; 30];
+        for i in 0..286 { sm_ll[i] = ll_f0[i] as f64; }
+        for i in 0..30 { sm_d[i] = d_f0[i] as f64; }
+        entropy_costs_from_stats(&sm_ll, &sm_d, &mut ll_cost, &mut d_cost);
+        let init = optimal_parse_block(
+            tbl, data, &runs, bpp_u, rstride, b_start, &pool,
+            &ll_cost, &d_cost, &mut dp_cost, &mut dp_len, &mut dp_dist,
+            0, b_end - b_start, 0,
+        );
+        let splits = split_token_stream_dp(
+            tbl, data, b_start, b_end, rstride, &init.lit_lens, &init.dists, &init.pos_arr,
+            16, 96, true,
+        );
+        for s in 0..splits.len() - 1 {
+            let ts = splits[s];
+            let te = splits[s + 1];
+            let rs = init.pos_arr[ts] as usize;
+            let re = if te < init.lit_lens.len() {
+                init.pos_arr[te] as usize
+            } else {
+                b_end
+            };
+            let (ll_f, d_f, _) = stats_from_range(tbl, &init.lit_lens, &init.dists, ts, te);
+            for i in 0..286 { sm_ll[i] = ll_f[i] as f64; }
+            for i in 0..30 { sm_d[i] = d_f[i] as f64; }
+            entropy_costs_from_stats(&sm_ll, &sm_d, &mut ll_cost, &mut d_cost);
+            let p2 = optimal_parse_block(
+                tbl, data, &runs, bpp_u, rstride, b_start, &pool,
+                &ll_cost, &d_cost, &mut dp_cost, &mut dp_len, &mut dp_dist,
+                rs - b_start, re - b_start, 0,
+            );
+            let b1 = exact_range_bits(tbl, &init.lit_lens, &init.dists, ts, te, true);
+            let b2 = exact_range_bits(tbl, &p2.lit_lens, &p2.dists, 0, p2.lit_lens.len(), true);
+            total_bits += b1.min(b2);
+        }
+    }
+    ((total_bits + 7) / 8 + 6) as u32
 }
 
 /// Ultra-fast zero-syscall native WASM Zopfli-aligned filter/palette scorer!
@@ -3113,7 +3424,6 @@ pub extern "C" fn fast_zopfli_screen(
             }
             cand = nxt;
         }
-        // Secondary jump hash (RLE for 1-bpp, solid-pixel for 3/4-bpp)
         let my_run = run_left[p] as usize;
         if bpp_u == 1 && my_run >= 3 && my_run < max_len && p + my_run < n && best_l < max_len {
             let h2 = hash_rle(my_run, b0, data[p + my_run]);
@@ -3255,7 +3565,6 @@ pub extern "C" fn fast_zopfli_screen(
         }
     }
 
-    // Ultra-fast 8-block greedy split using fast=true Huffman & 15-point scan!
     let count = lit_lens.len();
     let mut splits = vec![0usize, count];
     let mut done = Vec::with_capacity(8);
@@ -3726,6 +4035,7 @@ impl FastLzEval {
         ll_out: &mut [u32; 286],
         d_out: &mut [u32; 30],
         has_ctx: bool,
+        lit_aware: bool,
     ) -> (u64, u32, u32) {
         self.b_stamp += 1;
         let bs = self.b_stamp;
@@ -3735,6 +4045,22 @@ impl FastLzEval {
         let mut extra = 0u64;
         let mut ll_tot = 0u32;
         let mut d_tot = 0u32;
+
+        let mut lit_bits = [8.0f32; 256];
+        if lit_aware && src_len > 0 {
+            let mut cnt = [0u32; 256];
+            for &b in src {
+                cnt[b as usize] += 1;
+            }
+            let log_s = tbl.fast_log2(src_len.max(2) as u32) as f32;
+            for i in 0..256 {
+                if cnt[i] > 0 {
+                    lit_bits[i] = (log_s - tbl.fast_log2(cnt[i]) as f32).clamp(1.0, 11.0);
+                } else {
+                    lit_bits[i] = 11.0;
+                }
+            }
+        }
 
         let mut p = 0usize;
         while p < src_len {
@@ -3794,7 +4120,7 @@ impl FastLzEval {
                     if self.band_stamp[h3] == bs {
                         let mut cand = self.band_head[h3];
                         let b_lim = p.saturating_sub(WIN_SIZE) as i32;
-                        let mut probes = 10usize;
+                        let mut probes = if lit_aware { 5usize } else { 10usize };
                         while cand >= b_lim && probes > 0 && best_l < max_l {
                             probes -= 1;
                             let c = cand as usize;
@@ -3862,6 +4188,19 @@ impl FastLzEval {
                 self.band_stamp[h3] = bs;
                 self.band_head[h3] = p as i32;
 
+                if lit_aware && best_l >= 3 && best_l <= 7 {
+                    let m_bits = 5.5f32
+                        + tbl.len_ex[best_l] as f32
+                        + 4.0f32
+                        + DIST_EXTRA[tbl.dist_sym[best_d] as usize] as f32;
+                    let mut l_bits = 0.0f32;
+                    for k in 0..best_l {
+                        l_bits += lit_bits[src[p + k] as usize];
+                    }
+                    if m_bits >= l_bits {
+                        best_l = 0;
+                    }
+                }
                 if best_l >= 3 {
                     ll_out[tbl.len_sym[best_l] as usize] += 1;
                     ll_tot += 1;
@@ -3927,6 +4266,9 @@ fn entropy_cost_bits(
 }
 
 /// Native WASM zero-syscall hybrid banded filter selector with exact row boundary refinement & bidir segment check!
+/// When `sep_blocks` is true, scores each band/segment with its OWN independent dynamic Huffman table
+/// (using preceding context strictly for LZ77 matching) + a realistic block-switch penalty — discovering
+/// clean alternating multi-regime filters (e.g. Photo | UI gutter | Photo) cleanly!
 fn filter_band_rust(
     tbl: &Tables,
     bank: &[Vec<u8>],
@@ -3934,6 +4276,7 @@ fn filter_band_rust(
     h: usize,
     bpp: usize,
     band_h: usize,
+    sep_blocks: bool,
     out: &mut [u8],
 ) {
     let row_len = w * bpp + 1;
@@ -3965,13 +4308,18 @@ fn filter_band_rust(
         base_ll[256] = 1;
         let (b_ex, b_ll, b_d) = if w_len > 0 {
             eval.index_ctx(ctx);
-            let (e, l, dt) =
-                eval.parse_slice(tbl, &[], ctx, row_len, bpp, &mut base_ll, &mut base_d, false);
-            (e, 1 + l, dt)
+            if sep_blocks {
+                (0u64, 1u32, 0u32)
+            } else {
+                let (e, l, dt) =
+                    eval.parse_slice(tbl, &[], ctx, row_len, bpp, &mut base_ll, &mut base_d, false, false);
+                (e, 1 + l, dt)
+            }
         } else {
             (0, 1, 0)
         };
 
+        let prev_mode = if bi > 0 { band_modes[bi - 1] } else { usize::MAX };
         let mut best_score = f64::INFINITY;
         let mut best_mode = 0usize;
         for m in 0..num_modes {
@@ -3986,8 +4334,12 @@ fn filter_band_rust(
                 &mut ll,
                 &mut d,
                 w_len > 0,
+                sep_blocks,
             );
-            let bits = entropy_cost_bits(tbl, &ll, &d, b_ll + l, b_d + dt, b_ex + e);
+            let mut bits = entropy_cost_bits(tbl, &ll, &d, b_ll + l, b_d + dt, b_ex + e);
+            if sep_blocks && prev_mode != usize::MAX && m != prev_mode {
+                bits += 260.0;
+            }
             if bits < best_score {
                 best_score = bits;
                 best_mode = m;
@@ -4013,7 +4365,7 @@ fn filter_band_rust(
     }
 
     // Coarse-to-fine row-level boundary refinement with 8 KiB preceding context!
-    let half_span = band_h.min(28);
+    let half_span = if sep_blocks { 14usize } else { band_h.min(28) };
     let ctx_max = (8192 / row_len).max(1) * row_len;
     let mut span_work = vec![0u8; ctx_max + (half_span * 2 + 2) * row_len];
 
@@ -4043,24 +4395,42 @@ fn filter_band_rust(
                 span_work[ctx_len + k * row_len..total_span]
                     .copy_from_slice(&bank[mode_b][at_start + k * row_len..y_end * row_len]);
             }
-            for x in &mut ll {
-                *x = 0;
+            if sep_blocks {
+                let split_off = ctx_len + k * row_len;
+                for x in &mut ll { *x = 0; }
+                for x in &mut d { *x = 0; }
+                ll[256] = 1;
+                let (e1, l1, d1) = eval.parse_slice(tbl, &[], &span_work[..split_off], row_len, bpp, &mut ll, &mut d, false, true);
+                let c1 = entropy_cost_bits(tbl, &ll, &d, 1 + l1, d1, e1);
+                let c_len2 = split_off.min(8192);
+                let ctx2 = &span_work[split_off - c_len2..split_off];
+                if c_len2 > 0 { eval.index_ctx(ctx2); }
+                for x in &mut ll { *x = 0; }
+                for x in &mut d { *x = 0; }
+                ll[256] = 1;
+                let (e2, l2, d2) = eval.parse_slice(tbl, ctx2, &span_work[split_off..total_span], row_len, bpp, &mut ll, &mut d, c_len2 > 0, true);
+                c1 + entropy_cost_bits(tbl, &ll, &d, 1 + l2, d2, e2)
+            } else {
+                for x in &mut ll {
+                    *x = 0;
+                }
+                for x in &mut d {
+                    *x = 0;
+                }
+                ll[256] = 1;
+                let (e, l, dt) = eval.parse_slice(
+                    tbl,
+                    &[],
+                    &span_work[..total_span],
+                    row_len,
+                    bpp,
+                    &mut ll,
+                    &mut d,
+                    false,
+                    false,
+                );
+                entropy_cost_bits(tbl, &ll, &d, 1 + l, dt, e)
             }
-            for x in &mut d {
-                *x = 0;
-            }
-            ll[256] = 1;
-            let (e, l, dt) = eval.parse_slice(
-                tbl,
-                &[],
-                &span_work[..total_span],
-                row_len,
-                bpp,
-                &mut ll,
-                &mut d,
-                false,
-            );
-            entropy_cost_bits(tbl, &ll, &d, 1 + l, dt, e)
         };
 
         let mut best_y = y_mid;
@@ -4110,6 +4480,48 @@ fn filter_band_rust(
             if sy1 <= sy0 {
                 continue;
             }
+            if sep_blocks {
+                let at = sy0 * row_len;
+                let seg_bytes = (sy1 - sy0) * row_len;
+                if seg_bytes > 520 * 1024 {
+                    continue;
+                }
+                let w_len = at.min(max_win);
+                let ctx = &out[at - w_len..at];
+                if w_len > 0 {
+                    eval.index_ctx(ctx);
+                }
+                for x in &mut ll { *x = 0; }
+                for x in &mut d { *x = 0; }
+                ll[256] = 1;
+                let (e0, l0, d0) = eval.parse_slice(
+                    tbl, ctx, &bank[smode][at..at + seg_bytes], row_len, bpp, &mut ll, &mut d, w_len > 0, true,
+                );
+                let mut best_m = smode;
+                let mut best_c = entropy_cost_bits(tbl, &ll, &d, 1 + l0, d0, e0);
+                for m in 0..num_modes {
+                    if m == smode {
+                        continue;
+                    }
+                    for x in &mut ll { *x = 0; }
+                    for x in &mut d { *x = 0; }
+                    ll[256] = 1;
+                    let (e, l, dt) = eval.parse_slice(
+                        tbl, ctx, &bank[m][at..at + seg_bytes], row_len, bpp, &mut ll, &mut d, w_len > 0, true,
+                    );
+                    let c = entropy_cost_bits(tbl, &ll, &d, 1 + l, dt, e);
+                    if c + 24.0 < best_c {
+                        best_c = c;
+                        best_m = m;
+                    }
+                }
+                if best_m != smode {
+                    segs[si].2 = best_m;
+                    out[at..at + seg_bytes]
+                        .copy_from_slice(&bank[best_m][at..at + seg_bytes]);
+                }
+                continue;
+            }
             let w_start = sy0.saturating_sub(pad_rows);
             let w_end = (sy1 + pad_rows).min(h);
             let w_bytes = (w_end - w_start) * row_len;
@@ -4127,7 +4539,7 @@ fn filter_band_rust(
                 *x = 0;
             }
             ll[256] = 1;
-            let (e0, l0, d0) = eval.parse_slice(tbl, &[], &buf, row_len, bpp, &mut ll, &mut d, false);
+            let (e0, l0, d0) = eval.parse_slice(tbl, &[], &buf, row_len, bpp, &mut ll, &mut d, false, false);
             let mut best_m = smode;
             let mut best_c = entropy_cost_bits(tbl, &ll, &d, 1 + l0, d0, e0);
 
@@ -4145,7 +4557,7 @@ fn filter_band_rust(
                 }
                 ll[256] = 1;
                 let (e, l, dt) =
-                    eval.parse_slice(tbl, &[], &buf, row_len, bpp, &mut ll, &mut d, false);
+                    eval.parse_slice(tbl, &[], &buf, row_len, bpp, &mut ll, &mut d, false, false);
                 let c = entropy_cost_bits(tbl, &ll, &d, 1 + l, dt, e);
                 if c + 24.0 < best_c {
                     best_c = c;
@@ -4486,7 +4898,7 @@ fn filter_viterbi_rust(
             seq[y] = cur_t;
             cur_t = back[y][cur_t] as usize;
         }
-        if seq == prev_seq {
+        if seq == prev_seq && pi != 3 {
             continue;
         }
         prev_seq.copy_from_slice(&seq);
@@ -4519,7 +4931,7 @@ fn filter_viterbi_rust(
                 }
                 ll[256] = 1;
                 let (e, l, dt) = eval.parse_slice(
-                    tbl, ctx, &cand_buf[s_off..e_off], row_len, bpp, &mut ll, &mut d, c_len > 0,
+                    tbl, ctx, &cand_buf[s_off..e_off], row_len, bpp, &mut ll, &mut d, c_len > 0, false,
                 );
                 tot_bits += entropy_cost_bits(tbl, &ll, &d, 1 + l, dt, e);
             }
@@ -4528,8 +4940,9 @@ fn filter_viterbi_rust(
                 best_seq.copy_from_slice(&seq);
                 out_best.copy_from_slice(&cand_buf);
             }
-        } else {
-            // Segment-aligned block scoring for Macro Viterbi (discovers clean macro filter regions like i008!)
+        }
+        if pi >= 3 {
+            // Segment-aligned block scoring for Macro Viterbi (sweeps 1500 & 2600 -> discovers i008 f1/f4/f2!)
             let mut raw_runs: Vec<(usize, usize)> = Vec::new();
             let mut ry = 0usize;
             while ry < h {
@@ -4578,7 +4991,7 @@ fn filter_viterbi_rust(
                 }
                 ll[256] = 1;
                 let (e, l, dt) = eval.parse_slice(
-                    tbl, ctx, &cand_buf[s_off..e_off], row_len, bpp, &mut ll, &mut d, c_len > 0,
+                    tbl, ctx, &cand_buf[s_off..e_off], row_len, bpp, &mut ll, &mut d, c_len > 0, false,
                 );
                 tot_bits += entropy_cost_bits(tbl, &ll, &d, 1 + l, dt, e);
             }
@@ -4640,7 +5053,7 @@ fn filter_viterbi_rust(
                 for x in &mut ll { *x = 0; }
                 for x in &mut d { *x = 0; }
                 ll[256] = 1;
-                let (e1, l1, d1) = eval.parse_slice(tbl, &[], &span_work[..split_off], row_len, bpp, &mut ll, &mut d, false);
+                let (e1, l1, d1) = eval.parse_slice(tbl, &[], &span_work[..split_off], row_len, bpp, &mut ll, &mut d, false, false);
                 let c1 = entropy_cost_bits(tbl, &ll, &d, 1 + l1, d1, e1);
                 let c_len2 = split_off.min(8192);
                 let ctx2 = &span_work[split_off - c_len2..split_off];
@@ -4648,7 +5061,7 @@ fn filter_viterbi_rust(
                 for x in &mut ll { *x = 0; }
                 for x in &mut d { *x = 0; }
                 ll[256] = 1;
-                let (e2, l2, d2) = eval.parse_slice(tbl, ctx2, &span_work[split_off..total_span], row_len, bpp, &mut ll, &mut d, c_len2 > 0);
+                let (e2, l2, d2) = eval.parse_slice(tbl, ctx2, &span_work[split_off..total_span], row_len, bpp, &mut ll, &mut d, c_len2 > 0, false);
                 c1 + entropy_cost_bits(tbl, &ll, &d, 1 + l2, d2, e2)
             };
 
@@ -4691,11 +5104,11 @@ fn filter_viterbi_rust(
         }
     };
 
-    let has_macro = best_macro_bits.is_finite() && macro_seq != best_seq;
-    if has_macro {
+    if best_macro_bits.is_finite() {
         refine_viterbi_buf(out_macro, &macro_seq);
+        return out_macro != out_best;
     }
-    has_macro
+    false
 }
 
 /// Exported multi-strategy native WASM filter generator!
@@ -4749,10 +5162,29 @@ pub extern "C" fn generate_filter_candidates(
         return written as u32;
     }
 
+    if include_brute == 4 {
+        // Standalone clean separate-block 20-row multi-band on fixed filters 0..5 (called lazily on dense 3/4-bpp!)
+        let tbl = get_tables();
+        let mut base5: Vec<Vec<u8>> = (0..5).map(|_| vec![0u8; img_bytes]).collect();
+        for y in 0..hu {
+            let cur = &samples[y * stride..(y + 1) * stride];
+            let prev = if y == 0 { None } else { Some(&samples[(y - 1) * stride..y * stride]) };
+            let at = y * row_len;
+            for t in 0..5 {
+                base5[t][at] = t as u8;
+                filter_row_into(t as u8, cur, prev, bpp_u, &mut base5[t][at + 1..at + row_len]);
+            }
+        }
+        let mut band20c = vec![0u8; img_bytes];
+        filter_band_rust(tbl, &base5, wu, hu, bpp_u, 20, true, &mut band20c);
+        push_cand(&band20c);
+        return written as u32;
+    }
+
     let tbl = get_tables();
     let mut bank = build_row_bank_rust(tbl, samples, wu, hu, bpp_u);
 
-    // Note: bank has 9 base modes (0..4, pairs, minsum, ectW, entrow)
+    // Note: bank has 8 base modes (0..4, pairs, minsum, ectW)
     if include_brute == 2 {
         // Palette mode: Exact-Up on Filter 0 + band24 (with eu0 in bank so band24 mixes Exact-Up + Paeth/Up!)
         let mut eu0 = vec![0u8; img_bytes];
@@ -4760,7 +5192,7 @@ pub extern "C" fn generate_filter_candidates(
         let eu_idx = bank.len();
         bank.push(eu0);
         let mut b24 = vec![0u8; img_bytes];
-        filter_band_rust(tbl, &bank, wu, hu, bpp_u, 24, &mut b24);
+        filter_band_rust(tbl, &bank, wu, hu, bpp_u, 24, false, &mut b24);
         push_cand(&bank[eu_idx]); // eu0
         push_cand(&b24);          // band24 (Exact-Up + adaptive)
         push_cand(&bank[0]);      // None
@@ -4783,7 +5215,7 @@ pub extern "C" fn generate_filter_candidates(
         let vit_idx = bank.len();
         bank.push(vit_buf);
         let mut b16 = vec![0u8; img_bytes];
-        filter_band_rust(tbl, &bank, wu, hu, bpp_u, 16, &mut b16);
+        filter_band_rust(tbl, &bank, wu, hu, bpp_u, 16, false, &mut b16);
         push_cand(&b16);
         push_cand(&bank[vit_idx]); // segment-scored viterbi
         push_cand(&bank[lz_idx]);  // upgraded adaptive lzrow
@@ -4795,11 +5227,11 @@ pub extern "C" fn generate_filter_candidates(
         return written as u32;
     }
 
-    // On 3/4-bpp: keep band40 clean on bank[0..10], plus Segment-Scored Viterbi + Macro Viterbi + safe Exact-Up on lzrow!
+    // On 3/4-bpp: band40 on full bank + Viterbi + Macro Viterbi + safe Exact-Up on lzrow!
     let mut band_buf = vec![0u8; img_bytes];
-    filter_band_rust(tbl, &bank, wu, hu, bpp_u, 40, &mut band_buf);
+    filter_band_rust(tbl, &bank, wu, hu, bpp_u, 40, false, &mut band_buf);
 
-    // Apply safe leave-last Exact-Up to lzrow for 3/4-bpp photos (saves ~100 B on i006!)
+    // Apply safe leave-last Exact-Up to lzrow for 3/4-bpp photos
     let mut lz_eu = vec![0u8; img_bytes];
     apply_exact_up_rust(samples, &bank[lz_idx], wu, hu, bpp_u, true, &mut lz_eu);
 

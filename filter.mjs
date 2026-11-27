@@ -5,6 +5,7 @@ import {
   fastZopfliScreenWasm,
   generateFilterCandidatesWasm,
   optimizePaletteTspWasm,
+  scoutZopfliSizeWasm,
 } from './zopfli.mjs';
 
 function wordsOf(rgba) {
@@ -246,7 +247,7 @@ const SCREEN_LO = Object.freeze({ level: 4, memLevel: 8, strategy: constants.Z_D
 export function screenCandidates(rgba, width, height, topK = 3) {
   const forms = formsOf(rgba, width, height);
   const pool = [];
-  const maxPool = Math.max(5, topK + 2);
+  const maxPool = Math.max(7, topK + 3);
 
   const consider = (form, choice, data, estZlibBytes, bytes) => {
     for (let i = 0; i < pool.length; i++) {
@@ -284,7 +285,7 @@ export function screenCandidates(rgba, width, height, topK = 3) {
           const z = deflateSync(cands[m], SCREEN_PAL).length;
           consider(form, names[m], cands[m], z, z + chunks);
         }
-      } else if (form.name === 'pal-lzfreq' || form.name === 'pal-bcooccur') {
+      } else if (form.name === 'pal-lzfreq' || form.name === 'pal-lzpure' || form.name === 'pal-bcooccur') {
         const cands = generateFilterCandidatesWasm(form.samples, width, height, 1, 3, 2);
         const names = ['eu0', '0'];
         for (let m = 0; m < cands.length; m++) {
@@ -305,7 +306,9 @@ export function screenCandidates(rgba, width, height, topK = 3) {
     // Native WASM returns elite finalists including split fine/macro Viterbi DP & adaptive LZ-Row!
     const mode = form.bpp <= 2 ? 1 : 0;
     const cands = generateFilterCandidatesWasm(form.samples, width, height, form.bpp, mode, 6);
-    const names = mode === 1 ? ['band16', 'viterbi', 'lzrow', '0', '4', 'vitM'] : ['band40', 'viterbi', 'lzrow', '0', '4', 'vitM'];
+    const names = mode === 1
+      ? ['band16', 'viterbi', 'lzrow', '0', '4', 'vitM']
+      : ['band40', 'viterbi', 'lzrow', '0', '4', 'vitM'];
     const sOpt = form.bpp <= 2 ? SCREEN_HI : SCREEN_LO;
     for (let m = 0; m < cands.length; m++) {
       const z = deflateSync(cands[m], sOpt).length;
@@ -313,23 +316,45 @@ export function screenCandidates(rgba, width, height, topK = 3) {
     }
   }
 
-  // Hybrid Zopfli-aligned WASM tie-breaker: when non-palette #2 is within 3.0% of #1 and not a dense photo,
-  // re-rank top 4 close finalists with native WASM fast_zopfli_screen (eliminates zlib-vs-Zopfli rank inversions!).
+  // Hybrid Zopfli-aligned WASM tie-breaker:
+  // - On standard images (estBytes <= 135 KB): ultra-fast lazy+DP-split WASM screen on close non-fixed finalists!
+  // - On dense multi-regime 3/4-bpp images (135 KB < estBytes <= 240 KB): lazily generate clean separate-block
+  //   band20c and scout #1 vs band20c via native WASM hash3+DP scout so true Zopfli winners always win!
   if (
     pool.length > 1 &&
     pool[0].form.colourType !== 3 &&
-    pool[0].estBytes <= 135_000 &&
-    pool[1].bytes <= pool[0].bytes * 1.03
+    pool[1].bytes <= pool[0].bytes * 1.035
   ) {
     const topScreenBytes = pool[0].bytes;
-    const lim = Math.min(pool[0].form.bpp === 1 ? 3 : 5, pool.length);
-    const tol = pool[0].form.bpp === 1 ? 1.02 : 1.03;
-    for (let i = 0; i < lim; i++) {
-      const c = pool[i];
-      if (i > 0 && c.bytes > topScreenBytes * tol) break;
-      if (i > 0 && c.form.bpp > 1 && (c.choice === '0' || c.choice === '4')) continue;
-      const z = fastZopfliScreenWasm(c.data, width * c.form.bpp + 1, c.form.bpp);
-      c.zopScreen = z + chunkBytes(c.form);
+    if (pool[0].estBytes <= 135_000) {
+      const maxScore = pool[0].form.bpp === 1 ? 3 : 4;
+      const tol = pool[0].form.bpp === 1 ? 1.02 : 1.035;
+      let scoredCount = 0;
+      for (let i = 0; i < pool.length && scoredCount < maxScore; i++) {
+        const c = pool[i];
+        if (i > 0 && c.bytes > topScreenBytes * tol) break;
+        if (i > 0 && c.form.bpp > 1 && (c.choice === '0' || c.choice === '4')) continue;
+        const z = fastZopfliScreenWasm(c.data, width * c.form.bpp + 1, c.form.bpp);
+        c.zopScreen = z + chunkBytes(c.form);
+        scoredCount++;
+      }
+    } else if (pool[0].estBytes <= 240_000 && pool[0].form.bpp >= 3) {
+      const form0 = pool[0].form;
+      const chunks0 = chunkBytes(form0);
+      const extra = generateFilterCandidatesWasm(form0.samples, width, height, form0.bpp, 4, 1);
+      if (extra.length > 0) {
+        const b20Data = extra[0];
+        const b20Z = deflateSync(b20Data, SCREEN_LO).length;
+        const b20Bytes = b20Z + chunks0;
+        if (b20Bytes <= topScreenBytes * 1.02) {
+          const b20Cand = { form: form0, choice: 'band20c', data: b20Data, estBytes: b20Z, bytes: b20Bytes };
+          pool.push(b20Cand);
+          for (const c of [pool[0], b20Cand]) {
+            const z = scoutZopfliSizeWasm(c.data, width * c.form.bpp + 1, c.form.bpp);
+            c.zopScreen = z + chunkBytes(c.form);
+          }
+        }
+      }
     }
     const scored = [];
     const unscored = [];
@@ -337,9 +362,11 @@ export function screenCandidates(rgba, width, height, topK = 3) {
       if (pool[i].zopScreen !== undefined) scored.push(pool[i]);
       else unscored.push(pool[i]);
     }
-    scored.sort((a, b) => a.zopScreen - b.zopScreen);
-    pool.length = 0;
-    pool.push(...scored, ...unscored);
+    if (scored.length > 1) {
+      scored.sort((a, b) => a.zopScreen - b.zopScreen);
+      pool.length = 0;
+      pool.push(...scored, ...unscored);
+    }
   }
 
   return pool.slice(0, topK);
