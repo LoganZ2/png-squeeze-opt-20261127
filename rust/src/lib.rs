@@ -738,6 +738,175 @@ fn build_best_dynamic_tree(
     if c3.total_bits < best.total_bits {
         best = c3;
     }
+
+    // Exact Kraft-preserving (sum == 32768) code-length RLE repair & 0-hole bridging!
+    // Guaranteed valid complete canonical Huffman tree:
+    //   Move A (Swap): lens[i] (L -> L+1) & lens[j] (L+1 -> L) => net Kraft delta = 0
+    //   Move B (0-hole): lens[hole] (0 -> L+1) & lens[j] (L -> L+1) => net Kraft delta = 0
+    let mut ll = best.ll_lens;
+    let dl = best.d_lens;
+    let mut best_bits = best.total_bits;
+    let mut improved_rle = false;
+
+    let calc_data_bits = |ll_a: &[u8; 286], d_a: &[u8; 30]| -> u64 {
+        let mut db = extra_bits_total;
+        for i in 0..286 {
+            if ll_freq[i] > 0 {
+                db += ll_freq[i] as u64 * ll_a[i] as u64;
+            }
+        }
+        for i in 0..30 {
+            if d_freq[i] > 0 {
+                db += d_freq[i] as u64 * d_a[i] as u64;
+            }
+        }
+        db
+    };
+
+    let active_ll = ll.iter().filter(|&&v| v > 0).count();
+    if active_ll >= 3 {
+        let mut hlit = 286usize;
+        while hlit > 257 && ll[hlit - 1] == 0 {
+            hlit -= 1;
+        }
+        let mut cur_data = calc_data_bits(&ll, &dl);
+        for _pass in 0..2 {
+            let mut pass_imp = false;
+            // Find cheapest-to-lengthen symbol at each length L in 1..15 (min ll_freq[j])
+            let mut min_freq_sym = [usize::MAX; 16];
+            for idx in 0..hlit {
+                let l = ll[idx] as usize;
+                if l >= 1 && l < 15 {
+                    let prev = min_freq_sym[l];
+                    if prev == usize::MAX || ll_freq[idx] < ll_freq[prev] {
+                        min_freq_sym[l] = idx;
+                    }
+                }
+            }
+            // Move B: Bridge single 0-holes `v, 0, v` (or `v, 0, v, v`) where v >= 2
+            for i in 1..hlit.saturating_sub(1) {
+                if ll[i] == 0 && ll[i - 1] >= 2 && ll[i - 1] == ll[i + 1] {
+                    let v = ll[i - 1] as usize;
+                    let donor = min_freq_sym[v - 1];
+                    if donor != usize::MAX && ll_freq[donor] <= 20 && donor != i - 1 && donor != i + 1 {
+                        let new_data = cur_data + ll_freq[donor] as u64;
+                        if new_data < best_bits {
+                            ll[i] = v as u8;
+                            ll[donor] = v as u8;
+                            let hdr = build_dynamic_header(&ll, &dl, false);
+                            let tot = 3 + hdr.header_bits + new_data;
+                            if tot < best_bits {
+                                best_bits = tot;
+                                cur_data = new_data;
+                                best = DynTree { ll_lens: ll, d_lens: dl, hdr, total_bits: tot };
+                                improved_rle = true;
+                                pass_imp = true;
+                                // Refresh donor for v-1
+                                min_freq_sym[v - 1] = usize::MAX;
+                                for idx in 0..hlit {
+                                    if ll[idx] as usize == v - 1 {
+                                        let prev = min_freq_sym[v - 1];
+                                        if prev == usize::MAX || ll_freq[idx] < ll_freq[prev] {
+                                            min_freq_sym[v - 1] = idx;
+                                        }
+                                    }
+                                }
+                            } else {
+                                ll[i] = 0;
+                                ll[donor] = (v - 1) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+            // Move A: Smooth singleton bumps `v, v-1, v` or `v, v+1, v` via Kraft-preserving swap
+            let mut max_freq_sym = [usize::MAX; 16];
+            for idx in 0..hlit {
+                let l = ll[idx] as usize;
+                if l >= 2 && l <= 15 {
+                    let prev = max_freq_sym[l];
+                    if prev == usize::MAX || ll_freq[idx] > ll_freq[prev] {
+                        max_freq_sym[l] = idx;
+                    }
+                }
+            }
+            for i in 1..hlit.saturating_sub(1) {
+                let cur_l = ll[i] as usize;
+                let v = ll[i - 1] as usize;
+                if v >= 2 && v == ll[i + 1] as usize && cur_l != v && cur_l > 0 {
+                    if cur_l + 1 == v {
+                        // Lengthen i: v-1 -> v, shorten highest-freq symbol at length v -> v-1
+                        let partner = max_freq_sym[v];
+                        if partner != usize::MAX && partner != i && partner != i - 1 && partner != i + 1 {
+                            let df = ll_freq[i] as i64 - ll_freq[partner] as i64;
+                            if df <= 20 {
+                                let new_data = (cur_data as i64 + df) as u64;
+                                ll[i] = v as u8;
+                                ll[partner] = (v - 1) as u8;
+                                let hdr = build_dynamic_header(&ll, &dl, false);
+                                let tot = 3 + hdr.header_bits + new_data;
+                                if tot < best_bits {
+                                    best_bits = tot;
+                                    cur_data = new_data;
+                                    best = DynTree { ll_lens: ll, d_lens: dl, hdr, total_bits: tot };
+                                    improved_rle = true;
+                                    pass_imp = true;
+                                    max_freq_sym[v] = usize::MAX;
+                                    for idx in 0..hlit {
+                                        if ll[idx] as usize == v {
+                                            let prev = max_freq_sym[v];
+                                            if prev == usize::MAX || ll_freq[idx] > ll_freq[prev] {
+                                                max_freq_sym[v] = idx;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    ll[i] = cur_l as u8;
+                                    ll[partner] = v as u8;
+                                }
+                            }
+                        }
+                    } else if cur_l == v + 1 && v < 15 {
+                        // Shorten i: v+1 -> v, lengthen lowest-freq symbol at length v -> v+1
+                        let partner = min_freq_sym[v];
+                        if partner != usize::MAX && partner != i && partner != i - 1 && partner != i + 1 {
+                            let df = ll_freq[partner] as i64 - ll_freq[i] as i64;
+                            if df <= 20 {
+                                let new_data = (cur_data as i64 + df) as u64;
+                                ll[i] = v as u8;
+                                ll[partner] = (v + 1) as u8;
+                                let hdr = build_dynamic_header(&ll, &dl, false);
+                                let tot = 3 + hdr.header_bits + new_data;
+                                if tot < best_bits {
+                                    best_bits = tot;
+                                    cur_data = new_data;
+                                    best = DynTree { ll_lens: ll, d_lens: dl, hdr, total_bits: tot };
+                                    improved_rle = true;
+                                    pass_imp = true;
+                                    min_freq_sym[v] = usize::MAX;
+                                    for idx in 0..hlit {
+                                        if ll[idx] as usize == v {
+                                            let prev = min_freq_sym[v];
+                                            if prev == usize::MAX || ll_freq[idx] < ll_freq[prev] {
+                                                min_freq_sym[v] = idx;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    ll[i] = cur_l as u8;
+                                    ll[partner] = v as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !pass_imp {
+                break;
+            }
+        }
+    }
+    let _ = improved_rle;
     best
 }
 
@@ -1471,7 +1640,7 @@ fn split_token_stream_dp(
     }
 
     let greedy = split_token_stream(tbl, lit_lens, dists, max_blocks, min_tokens);
-    if count < 10_000 {
+    if count < 256 {
         return greedy;
     }
     let eval_part = |sp: &[usize]| -> u64 {
@@ -1609,8 +1778,12 @@ fn split_token_stream_dp(
         }
     }
 
-    // Run 1 well-calibrated header-bias sweep (+140 bits), clean up with exact Huffman merging, keep global best!
-    let biases: &[f64] = if fast_eval { &[120.0] } else { &[140.0] };
+    // Multi-bias header sweep, exact Huffman merge cleanup, keep strictly global best!
+    let biases: &[f64] = if fast_eval {
+        &[120.0]
+    } else {
+        &[40.0, 120.0, 220.0]
+    };
     for &bias in biases {
         let mut dp = vec![f64::INFINITY; m + 1];
         let mut prev = vec![0usize; m + 1];
@@ -1666,8 +1839,7 @@ fn split_token_stream_dp(
             }
         }
         let tot_bits: u64 = seg_bits.iter().sum();
-        let margin = if reg_cuts.is_empty() { 192 } else { 48 };
-        if tot_bits + margin < best_bits {
+        if tot_bits < best_bits {
             best_bits = tot_bits;
             best_splits = cand;
         }
@@ -1763,9 +1935,7 @@ fn match_len_fast(data: &[u8], c: usize, p: usize, start: usize, max_len: usize)
     l
 }
 
-/// 64K Unpruned Binary-Tree (BT3) Match Finder: inserts `p` as the new root of `bt_head[h]` while walking
-/// root-to-leaf in STRICTLY INCREASING distance order (`dist = p - c`), finding exact Pareto-optimal
-/// matches across the entire 32 KiB window without hash-chain clogging or tree decapitation!
+/// 64K Binary-Tree (BT3) Exact Pareto Match Finder (`min_dist[3..=258]`):
 fn precompute_block_matches(
     tbl: &Tables,
     data: &[u8],
@@ -1797,7 +1967,7 @@ fn precompute_block_matches(
     let bt_depth = if max_depth <= 64 {
         max_depth
     } else if bpp == 1 {
-        max_depth.max(1536)
+        max_depth.max(2048)
     } else {
         max_depth.max(768)
     };
@@ -1808,14 +1978,14 @@ fn precompute_block_matches(
         let rem = b_end - p;
         let max_len = rem.min(258);
 
-        // Fast path 1: period-1 RLE full match (dist=1 is globally optimal; interior bytes of >=259 runs need no BT3 entry!)
+        // Fast path 1: period-1 RLE full match (dist=1 is globally optimal)
         if p > 0 && unsafe { *ptr.add(p) == *ptr.add(p - 1) } && (run_left[p] as usize) >= max_len && max_len >= 3 {
             pool.m_len.push(max_len as u16);
             pool.m_dist.push(1);
             continue;
         }
 
-        // Fast path 2: period-bpp full match (dist=bpp has 0 extra bits; interior bytes need no BT3 entry!)
+        // Fast path 2: period-bpp full match (dist=bpp has 0 extra bits)
         if let Some(rb) = run_bpp {
             if (rb[p] as usize) >= max_len && max_len >= 3 {
                 if p > 0 && unsafe { *ptr.add(p) == *ptr.add(p - 1) } && run_left[p] >= 3 {
@@ -1836,9 +2006,10 @@ fn precompute_block_matches(
         let limit = p.saturating_sub(WIN_SIZE) as i32;
         let b0 = unsafe { *ptr.add(p) };
         let my_run = run_left[p] as usize;
+        let my_bpp_run = run_bpp.map_or(0, |rb| rb[p] as usize);
         let row_len_above = run_row.map_or(0, |rr| (rr[p] as usize).min(max_len));
 
-        // Seed exact Pareto min_dist[3..=max_found] from O(1) structural matches (dist=1, bpp, row_stride)
+        // Seed exact Pareto min_dist[3..=max_found] from O(1) structural matches (dist=1, 2, bpp, row_stride)
         let mut max_found = 2usize;
         if p > 0 && unsafe { *ptr.add(p - 1) == b0 } && my_run >= 3 {
             let rl = my_run.min(max_len);
@@ -1847,20 +2018,34 @@ fn precompute_block_matches(
             }
             max_found = rl;
         }
-        if let Some(rb) = run_bpp {
-            let v = (rb[p] as usize).min(max_len);
-            if v >= 3 {
-                if v > max_found {
-                    for k in max_found + 1..=v {
-                        min_dist[k] = bpp as u16;
+        if bpp > 2 && p >= 2 && unsafe { *ptr.add(p - 2) == b0 && *ptr.add(p - 1) == *ptr.add(p + 1) } {
+            let l2 = match_len_fast(data, p - 2, p, 2, max_len);
+            if l2 >= 3 {
+                if l2 > max_found {
+                    for k in max_found + 1..=l2 {
+                        min_dist[k] = 2;
                     }
-                    max_found = v;
+                    max_found = l2;
                 }
-                let mut k = v;
-                while k >= 3 && (bpp as u16) < min_dist[k] {
-                    min_dist[k] = bpp as u16;
+                let mut k = l2;
+                while k >= 3 && 2u16 < min_dist[k] {
+                    min_dist[k] = 2;
                     k -= 1;
                 }
+            }
+        }
+        if my_bpp_run >= 3 {
+            let v = my_bpp_run.min(max_len);
+            if v > max_found {
+                for k in max_found + 1..=v {
+                    min_dist[k] = bpp as u16;
+                }
+                max_found = v;
+            }
+            let mut k = v;
+            while k >= 3 && (bpp as u16) < min_dist[k] {
+                min_dist[k] = bpp as u16;
+                k -= 1;
             }
         }
         if row_len_above >= 3 {
@@ -1878,7 +2063,7 @@ fn precompute_block_matches(
             }
         }
 
-        // Unpruned 64K BT3 walk + root insertion (L2-resident 2^16 hash table + inline 3-byte fast-path!):
+        // Full BT3 search & insert
         let mut bt_exhausted = true;
         {
             let h = hash3(data, p);
@@ -1959,7 +2144,7 @@ fn precompute_block_matches(
             }
         }
 
-        // Extra O(1) multi-row probes ONLY when BT3 hit depth limit (99.9% skipped with bit-exact identical result!)
+        // Extra O(1) multi-row probes (2..=6 * row_stride) when BT3 truncated
         if !bt_exhausted && row_stride > 1 {
             let b1 = unsafe { *ptr.add(p + 1) };
             let b2 = unsafe { *ptr.add(p + 2) };
@@ -2025,6 +2210,7 @@ fn optimal_parse_block(
     pool: &MatchPool,
     ll_cost: &[f32; 286],
     d_cost: &[f32; 30],
+    hot_dists: &[(u16, f32)],
     dp_cost: &mut [f32],
     dp_len: &mut [u16],
     dp_dist: &mut [u16],
@@ -2037,16 +2223,24 @@ fn optimal_parse_block(
         len_full[l] = ll_cost[tbl.len_sym[l] as usize] + tbl.len_ex[l] as f32;
     }
     let mut dist_full = [0f32; 30];
+    let mut pref_max_dc = [0f32; 30];
+    let mut cur_max_dc = 0f32;
     for s in 0..30 {
         dist_full[s] = d_cost[s] + DIST_EXTRA[s] as f32;
+        pref_max_dc[s] = cur_max_dc;
+        if dist_full[s] > cur_max_dc {
+            cur_max_dc = dist_full[s];
+        }
     }
 
     let bpp_dsym = tbl.dist_sym[bpp] as usize;
     let bpp_dcost = dist_full[bpp_dsym];
-    let row_dcost = if row_stride > 1 && row_stride <= WIN_SIZE {
-        dist_full[tbl.dist_sym[row_stride] as usize]
+    let bpp_nonmono = bpp > 1 && bpp_dcost + 0.05 < pref_max_dc[bpp_dsym];
+    let (row_dcost, row_nonmono) = if row_stride > 1 && row_stride <= WIN_SIZE {
+        let rds = tbl.dist_sym[row_stride] as usize;
+        (dist_full[rds], dist_full[rds] + 0.05 < pref_max_dc[rds])
     } else {
-        1e9f32
+        (1e9f32, false)
     };
     let cost_258_1 = len_full[258] + dist_full[0];
     let cost_258_bpp = len_full[258] + bpp_dcost;
@@ -2143,13 +2337,55 @@ fn optimal_parse_block(
             }
             let bl = rbp.min(rem).min(258);
             if bl >= 3 {
-                let mc = c + bpp_dcost + unsafe { *len_full.get_unchecked(bl) };
-                let ni = rel + bl;
-                unsafe {
-                    if mc < *dp_cost.get_unchecked(ni) {
-                        *dp_cost.get_unchecked_mut(ni) = mc;
-                        *dp_len.get_unchecked_mut(ni) = bl as u16;
-                        *dp_dist.get_unchecked_mut(ni) = bpp as u16;
+                let base_b = c + bpp_dcost;
+                if bpp_nonmono {
+                    if exact_mode == 2 || bl <= dense_lim {
+                        for l in 3..=bl {
+                            let ni = rel + l;
+                            unsafe {
+                                let mc = base_b + *len_full.get_unchecked(l);
+                                if mc < *dp_cost.get_unchecked(ni) {
+                                    *dp_cost.get_unchecked_mut(ni) = mc;
+                                    *dp_len.get_unchecked_mut(ni) = l as u16;
+                                    *dp_dist.get_unchecked_mut(ni) = bpp as u16;
+                                }
+                            }
+                        }
+                    } else {
+                        let de = dense_lim.min(bl);
+                        for l in 3..=de {
+                            let ni = rel + l;
+                            unsafe {
+                                let mc = base_b + *len_full.get_unchecked(l);
+                                if mc < *dp_cost.get_unchecked(ni) {
+                                    *dp_cost.get_unchecked_mut(ni) = mc;
+                                    *dp_len.get_unchecked_mut(ni) = l as u16;
+                                    *dp_dist.get_unchecked_mut(ni) = bpp as u16;
+                                }
+                            }
+                        }
+                        let ts = bl.saturating_sub(tail_pad).max(de + 1);
+                        for l in ts..=bl {
+                            let ni = rel + l;
+                            unsafe {
+                                let mc = base_b + *len_full.get_unchecked(l);
+                                if mc < *dp_cost.get_unchecked(ni) {
+                                    *dp_cost.get_unchecked_mut(ni) = mc;
+                                    *dp_len.get_unchecked_mut(ni) = l as u16;
+                                    *dp_dist.get_unchecked_mut(ni) = bpp as u16;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let mc = base_b + unsafe { *len_full.get_unchecked(bl) };
+                    let ni = rel + bl;
+                    unsafe {
+                        if mc < *dp_cost.get_unchecked(ni) {
+                            *dp_cost.get_unchecked_mut(ni) = mc;
+                            *dp_len.get_unchecked_mut(ni) = bl as u16;
+                            *dp_dist.get_unchecked_mut(ni) = bpp as u16;
+                        }
                     }
                 }
             }
@@ -2167,13 +2403,99 @@ fn optimal_parse_block(
         if let Some(rr) = run_row {
             let rl = (unsafe { *rr.get_unchecked(p) } as usize).min(rem).min(258);
             if rl >= 3 {
-                let mc = c + row_dcost + unsafe { *len_full.get_unchecked(rl) };
-                let ni = rel + rl;
-                unsafe {
-                    if mc < *dp_cost.get_unchecked(ni) {
-                        *dp_cost.get_unchecked_mut(ni) = mc;
-                        *dp_len.get_unchecked_mut(ni) = rl as u16;
-                        *dp_dist.get_unchecked_mut(ni) = row_stride as u16;
+                let base_r = c + row_dcost;
+                if row_nonmono {
+                    if exact_mode == 2 || rl <= dense_lim {
+                        for l in 3..=rl {
+                            let ni = rel + l;
+                            unsafe {
+                                let mc = base_r + *len_full.get_unchecked(l);
+                                if mc < *dp_cost.get_unchecked(ni) {
+                                    *dp_cost.get_unchecked_mut(ni) = mc;
+                                    *dp_len.get_unchecked_mut(ni) = l as u16;
+                                    *dp_dist.get_unchecked_mut(ni) = row_stride as u16;
+                                }
+                            }
+                        }
+                    } else {
+                        let de = dense_lim.min(rl);
+                        for l in 3..=de {
+                            let ni = rel + l;
+                            unsafe {
+                                let mc = base_r + *len_full.get_unchecked(l);
+                                if mc < *dp_cost.get_unchecked(ni) {
+                                    *dp_cost.get_unchecked_mut(ni) = mc;
+                                    *dp_len.get_unchecked_mut(ni) = l as u16;
+                                    *dp_dist.get_unchecked_mut(ni) = row_stride as u16;
+                                }
+                            }
+                        }
+                        let ts = rl.saturating_sub(tail_pad).max(de + 1);
+                        for l in ts..=rl {
+                            let ni = rel + l;
+                            unsafe {
+                                let mc = base_r + *len_full.get_unchecked(l);
+                                if mc < *dp_cost.get_unchecked(ni) {
+                                    *dp_cost.get_unchecked_mut(ni) = mc;
+                                    *dp_len.get_unchecked_mut(ni) = l as u16;
+                                    *dp_dist.get_unchecked_mut(ni) = row_stride as u16;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let mc = base_r + unsafe { *len_full.get_unchecked(rl) };
+                    let ni = rel + rl;
+                    unsafe {
+                        if mc < *dp_cost.get_unchecked(ni) {
+                            *dp_cost.get_unchecked_mut(ni) = mc;
+                            *dp_len.get_unchecked_mut(ni) = rl as u16;
+                            *dp_dist.get_unchecked_mut(ni) = row_stride as u16;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fast image-adaptive frequent-distance probes (recovers non-monotone cheap dist_sym matches!)
+        if !hot_dists.is_empty() && rem >= 3 {
+            let ptr = data.as_ptr();
+            let b1 = unsafe { *ptr.add(p + 1) };
+            let b2 = unsafe { *ptr.add(p + 2) };
+            let max_l = rem.min(258);
+            for &(hd, hdc) in hot_dists {
+                let d = hd as usize;
+                if p >= d
+                    && unsafe {
+                        *ptr.add(p - d) == dp_byte
+                            && *ptr.add(p - d + 1) == b1
+                            && *ptr.add(p - d + 2) == b2
+                    }
+                {
+                    let hl = match_len_fast(data, p - d, p, 3, max_l);
+                    let base_h = c + hdc;
+                    let de = hl.min(16);
+                    for l in 3..=de {
+                        let ni = rel + l;
+                        unsafe {
+                            let mc = base_h + *len_full.get_unchecked(l);
+                            if mc < *dp_cost.get_unchecked(ni) {
+                                *dp_cost.get_unchecked_mut(ni) = mc;
+                                *dp_len.get_unchecked_mut(ni) = l as u16;
+                                *dp_dist.get_unchecked_mut(ni) = hd;
+                            }
+                        }
+                    }
+                    if hl > de {
+                        let ni = rel + hl;
+                        unsafe {
+                            let mc = base_h + *len_full.get_unchecked(hl);
+                            if mc < *dp_cost.get_unchecked(ni) {
+                                *dp_cost.get_unchecked_mut(ni) = mc;
+                                *dp_len.get_unchecked_mut(ni) = hl as u16;
+                                *dp_dist.get_unchecked_mut(ni) = hd;
+                            }
+                        }
                     }
                 }
             }
@@ -2409,22 +2731,96 @@ fn zopfli_optimize_range(
         rng
     };
 
-    let final_mode: u8 = if allow_full_exact && (sub_end - sub_start) <= 2_000_000 {
+    let final_mode: u8 = if allow_full_exact && (sub_end - sub_start) <= 3_800_000 {
         2
     } else {
         1
     };
 
+    // Helper: extract up to 8 top frequent non-monotone distances from a match-heavy block (>50% matches)
+    let build_hot_dists = |dists_src: &[u16], dc_arr: &[f32; 30]| -> Vec<(u16, f32)> {
+        let mut match_cnt = 0usize;
+        for &d in dists_src {
+            if d > 0 {
+                match_cnt += 1;
+            }
+        }
+        if match_cnt * 2 <= dists_src.len() {
+            return Vec::new();
+        }
+        let mut dfull = [0f32; 30];
+        let mut pref_max = [0f32; 30];
+        let mut cur_max = 0f32;
+        for s in 0..30 {
+            dfull[s] = dc_arr[s] + DIST_EXTRA[s] as f32;
+            pref_max[s] = cur_max;
+            if dfull[s] > cur_max {
+                cur_max = dfull[s];
+            }
+        }
+        let mut nz: Vec<u16> = dists_src
+            .iter()
+            .copied()
+            .filter(|&d| d > 1 && d as usize != bpp && d as usize != row_stride)
+            .collect();
+        nz.sort_unstable();
+        let mut freq_d: Vec<(u32, u16)> = Vec::new();
+        let mut idx = 0usize;
+        while idx < nz.len() {
+            let v = nz[idx];
+            let mut end = idx + 1;
+            while end < nz.len() && nz[end] == v {
+                end += 1;
+            }
+            let cnt = (end - idx) as u32;
+            if cnt >= 12 {
+                let ds = tbl.dist_sym[v as usize] as usize;
+                if dfull[ds] + 0.4 < pref_max[ds] {
+                    freq_d.push((cnt, v));
+                }
+            }
+            idx = end;
+        }
+        // Also seed 2D structural neighbors (row_stride +/- bpp, 2*row_stride, 3*row_stride) if non-monotone cheap
+        if row_stride > bpp && row_stride + bpp <= WIN_SIZE {
+            for cand in [
+                row_stride - bpp,
+                row_stride + bpp,
+                row_stride * 2,
+                row_stride * 3,
+            ] {
+                if cand > 1 && cand <= WIN_SIZE && cand != bpp && cand != row_stride {
+                    let ds = tbl.dist_sym[cand] as usize;
+                    if dfull[ds] + 0.4 < pref_max[ds] && !freq_d.iter().any(|x| x.1 == cand as u16) {
+                        freq_d.push((1, cand as u16));
+                    }
+                }
+            }
+        }
+        freq_d.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        freq_d.truncate(5);
+        freq_d
+            .into_iter()
+            .map(|(_, d)| (d, dfull[tbl.dist_sym[d as usize] as usize]))
+            .collect()
+    };
+
     let mut same_streak = 0u32;
     let mut iter = 0usize;
+    let mut hot_dists: Vec<(u16, f32)> = Vec::new();
     while iter < iterations {
-        let exact_mode: u8 = if iter + 1 == iterations {
+        let exact_mode: u8 = if iter + 1 == iterations && allow_full_exact {
             final_mode
         } else if iter + 2 == iterations && allow_full_exact {
             1
         } else {
             0
         };
+        if allow_full_exact && iter + 2 >= iterations && !best_out.dists.is_empty() {
+            hot_dists = build_hot_dists(&best_out.dists, &d_cost);
+        } else {
+            hot_dists.clear();
+        }
         let parsed = optimal_parse_block(
             tbl,
             data,
@@ -2435,6 +2831,7 @@ fn zopfli_optimize_range(
             pool,
             &ll_cost,
             &d_cost,
+            &hot_dists,
             dp_cost,
             dp_len,
             dp_dist,
@@ -2527,6 +2924,31 @@ fn zopfli_optimize_range(
         }
         entropy_costs_from_stats(&ll_smooth, &d_smooth, &mut ll_cost, &mut d_cost);
         iter += 1;
+    }
+
+    // Exact integer-Huffman fixed-point polish (converges blocks strictly when final pass improved best_dyn!)
+    if allow_full_exact && iterations >= 6 && (sub_end - sub_start) <= 90_000 {
+        if let Some(ref bd) = best_dyn {
+            for i in 0..286 {
+                ll_cost[i] = if bd.ll_lens[i] > 0 { bd.ll_lens[i] as f32 } else { 16.0 };
+            }
+            for i in 0..30 {
+                d_cost[i] = if bd.d_lens[i] > 0 { bd.d_lens[i] as f32 } else { 16.0 };
+            }
+            let hd = build_hot_dists(&best_out.dists, &d_cost);
+            let parsed = optimal_parse_block(
+                tbl, data, runs, bpp, row_stride, b_start, pool, &ll_cost, &d_cost, &hd,
+                dp_cost, dp_len, dp_dist, sub_start, sub_end, final_mode,
+            );
+            let (ll_f, d_f, extra) =
+                stats_from_range(tbl, &parsed.lit_lens, &parsed.dists, 0, parsed.lit_lens.len());
+            let dyn_t = build_best_dynamic_tree(&ll_f, &d_f, extra, false);
+            let fix_b = fixed_block_bits(tbl, &ll_f, &d_f, extra);
+            let bits = dyn_t.total_bits.min(fix_b);
+            if bits < best_bits {
+                best_out = parsed;
+            }
+        }
     }
 
     best_out
@@ -2787,13 +3209,13 @@ pub extern "C" fn deflate_zopfli(
     let runs = compute_runs(data, bpp_u, rstride);
 
     // True Zopfli 2-Phase Optimal Block Splitting:
-    // Row-aligned mega-chunks <= 1.9 MB snapped to nearest macro filter-regime transition (±48 rows)!
+    // Single mega-chunk up to 3.8 MB (covers ALL 1280x720 RGBA images with ZERO artificial mega-seams!).
     let mut mega_bounds = Vec::new();
     mega_bounds.push(0usize);
     let max_mega = if rstride > 1 {
-        ((1_900_000 / rstride).max(1)) * rstride
+        ((3_800_000 / rstride).max(1)) * rstride
     } else {
-        1_900_000usize
+        3_800_000usize
     };
     let total_rows = if rstride > 1 { in_len / rstride } else { 0 };
     let mut cur_m = 0usize;
@@ -2866,15 +3288,16 @@ pub extern "C" fn deflate_zopfli(
         let b_start = mega_bounds[b];
         let b_end = mega_bounds[b + 1];
         precompute_block_matches(
-            tbl, data, &runs, b_start, b_end, &mut bt_head, &mut bt_son, rstride,
-            bpp_u, chain, &mut pool,
+            tbl, data, &runs, b_start, b_end, &mut bt_head, &mut bt_son,
+            rstride, bpp_u, chain, &mut pool,
         );
 
         let mut mega_blocks: Vec<FinalBlock> = Vec::with_capacity(per_mega_blocks + 4);
         if per_mega_blocks > 1 && b_end - b_start > 8192 {
-            // Phase 1: 2 fast global optimal parses to produce a clean optimal LZ77 token stream for splitting
+            // Phase 1: fast global optimal parse (3 iters on small <=1MB images for cleaner splits, 2 on large)
+            let p1_iters = if b_end - b_start <= 1_000_000 { 3 } else { 2 };
             let init = zopfli_optimize_range(
-                tbl, data, &runs, bpp_u, rstride, b_start, &pool, 2, &mut dp_cost, &mut dp_len,
+                tbl, data, &runs, bpp_u, rstride, b_start, &pool, p1_iters, &mut dp_cost, &mut dp_len,
                 &mut dp_dist, 0, b_end - b_start, None, false,
             );
             let splits = split_token_stream_dp(
@@ -3233,7 +3656,7 @@ pub extern "C" fn scout_zopfli_size(
         let b_end = mega_bounds[b + 1];
         precompute_scout_matches(
             data, &runs, b_start, b_end, &mut head, &mut prev, rstride,
-            bpp_u, 28, &mut pool,
+            bpp_u, 16, &mut pool,
         );
         // Fast exact_mode=0 global init (2 passes) -> Run-Aware DP split -> 1 local exact_mode=0 re-parse per block!
         let mut ll_cost = [0f32; 286];
@@ -3256,7 +3679,7 @@ pub extern "C" fn scout_zopfli_size(
         }
         let p0 = optimal_parse_block(
             tbl, data, &runs, bpp_u, rstride, b_start, &pool,
-            &ll_cost, &d_cost, &mut dp_cost, &mut dp_len, &mut dp_dist,
+            &ll_cost, &d_cost, &[], &mut dp_cost, &mut dp_len, &mut dp_dist,
             0, b_end - b_start, 0,
         );
         let (ll_f0, d_f0, _) = stats_from_range(tbl, &p0.lit_lens, &p0.dists, 0, p0.lit_lens.len());
@@ -3267,7 +3690,7 @@ pub extern "C" fn scout_zopfli_size(
         entropy_costs_from_stats(&sm_ll, &sm_d, &mut ll_cost, &mut d_cost);
         let init = optimal_parse_block(
             tbl, data, &runs, bpp_u, rstride, b_start, &pool,
-            &ll_cost, &d_cost, &mut dp_cost, &mut dp_len, &mut dp_dist,
+            &ll_cost, &d_cost, &[], &mut dp_cost, &mut dp_len, &mut dp_dist,
             0, b_end - b_start, 0,
         );
         let splits = split_token_stream_dp(
@@ -3289,7 +3712,7 @@ pub extern "C" fn scout_zopfli_size(
             entropy_costs_from_stats(&sm_ll, &sm_d, &mut ll_cost, &mut d_cost);
             let p2 = optimal_parse_block(
                 tbl, data, &runs, bpp_u, rstride, b_start, &pool,
-                &ll_cost, &d_cost, &mut dp_cost, &mut dp_len, &mut dp_dist,
+                &ll_cost, &d_cost, &[], &mut dp_cost, &mut dp_len, &mut dp_dist,
                 rs - b_start, re - b_start, 0,
             );
             let b1 = exact_range_bits(tbl, &init.lit_lens, &init.dists, ts, te, true);
@@ -4850,7 +5273,8 @@ fn filter_viterbi_rust(
     let penalties = [
         120.0 * scale,
         360.0 * scale,
-        1200.0 * scale,
+        900.0 * scale,
+        1600.0 * scale,
         2600.0 * scale,
     ];
     let mut dp = vec![[0.0f64; 5]; h];
@@ -5104,11 +5528,157 @@ fn filter_viterbi_rust(
         }
     };
 
+    if best_bits.is_finite() {
+        refine_viterbi_buf(out_best, &best_seq);
+    }
     if best_macro_bits.is_finite() {
         refine_viterbi_buf(out_macro, &macro_seq);
         return out_macro != out_best;
     }
     false
+}
+
+/// Native WASM zero-syscall multi-scale window filter polisher (24 -> 12 -> transition-focused 6 rows)!
+/// Refines an elite filter schedule (`band40`, `viterbi`, `vitM`, `band16`) using full 10-probe
+/// FastLzEval + entropy_cost_bits over fixed filters 0..4 plus incremental delta-H entropy (`ectW`).
+#[no_mangle]
+pub extern "C" fn polish_filter_candidate(
+    samples_ptr: *const u8,
+    base_ptr: *const u8,
+    w: u32,
+    h: u32,
+    bpp: u32,
+    out_ptr: *mut u8,
+) {
+    if samples_ptr.is_null() || base_ptr.is_null() || out_ptr.is_null() {
+        return;
+    }
+    let wu = w as usize;
+    let hu = h as usize;
+    let bpp_u = bpp as usize;
+    let stride = wu * bpp_u;
+    let row_len = stride + 1;
+    let img_bytes = hu * row_len;
+    let samples = unsafe { slice::from_raw_parts(samples_ptr, hu * stride) };
+    let base = unsafe { slice::from_raw_parts(base_ptr, img_bytes) };
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, img_bytes) };
+    out.copy_from_slice(base);
+
+    let tbl = get_tables();
+    let bank = build_row_bank_rust(tbl, samples, wu, hu, bpp_u);
+    let pad = (16384 / row_len).clamp(4, 14);
+    let mut eval = FastLzEval::new();
+    let mut ll = [0u32; 286];
+    let mut d = [0u32; 30];
+    let mut win_buf = vec![0u8; (32 + pad * 2) * row_len];
+
+    // On 1-bpp non-palette (e.g. greyscale UI/text), run a separate-block 30-row 0..4 pass first!
+    if bpp_u == 1 && hu >= 60 {
+        let step = 30usize;
+        let max_ctx = (16384 / row_len).max(1) * row_len;
+        for y0 in (0..hu).step_by(step) {
+            let y1 = (y0 + step).min(hu);
+            let at = y0 * row_len;
+            let seg_bytes = (y1 - y0) * row_len;
+            let c_len = at.min(max_ctx);
+            let ctx = &out[at - c_len..at];
+            if c_len > 0 {
+                eval.index_ctx(ctx);
+            }
+            for x in &mut ll { *x = 0; }
+            for x in &mut d { *x = 0; }
+            ll[256] = 1;
+            let (e0, l0, d0) = eval.parse_slice(
+                tbl, ctx, &out[at..at + seg_bytes], row_len, bpp_u, &mut ll, &mut d, c_len > 0, true,
+            );
+            let mut best_c = entropy_cost_bits(tbl, &ll, &d, 1 + l0, d0, e0);
+            let mut best_m = usize::MAX;
+            for m in 0..5usize {
+                if bank[m][at..at + seg_bytes] == out[at..at + seg_bytes] {
+                    continue;
+                }
+                for x in &mut ll { *x = 0; }
+                for x in &mut d { *x = 0; }
+                ll[256] = 1;
+                let (e, l, dt) = eval.parse_slice(
+                    tbl, ctx, &bank[m][at..at + seg_bytes], row_len, bpp_u, &mut ll, &mut d, c_len > 0, true,
+                );
+                let c = entropy_cost_bits(tbl, &ll, &d, 1 + l, dt, e);
+                if c + 96.0 < best_c {
+                    best_c = c;
+                    best_m = m;
+                }
+            }
+            if best_m != usize::MAX {
+                out[at..at + seg_bytes].copy_from_slice(&bank[best_m][at..at + seg_bytes]);
+            }
+        }
+    }
+
+    // Full-accuracy (10-probe) multi-scale window coordinate descent (24 -> 12 -> 6 rows)
+    let scales: &[(usize, usize)] = &[(24, 8), (12, 6), (6, 5)];
+    for &(step, n_modes) in scales {
+        let modes_lim = n_modes.min(bank.len());
+        for y0 in (0..hu).step_by(step) {
+            let y1 = (y0 + step).min(hu);
+            if step == 6 {
+                // Skip deep-interior uniform Filter-0 UI blocks on fine 6-row pass (saves ~1.5s, preserves all photo/edge polish!)
+                let c0 = y0.saturating_sub(24);
+                let c1 = (y1 + 24).min(hu);
+                let mut all_zero = true;
+                for cy in c0..c1 {
+                    if out[cy * row_len] != 0 {
+                        all_zero = false;
+                        break;
+                    }
+                }
+                if all_zero {
+                    continue;
+                }
+            }
+            let wy0 = y0.saturating_sub(pad);
+            let wy1 = (y1 + pad).min(hu);
+            let w_bytes = (wy1 - wy0) * row_len;
+            if w_bytes > win_buf.len() {
+                win_buf.resize(w_bytes, 0);
+            }
+            win_buf[..w_bytes].copy_from_slice(&out[wy0 * row_len..wy1 * row_len]);
+            let rel_off = (y0 - wy0) * row_len;
+            let seg_bytes = (y1 - y0) * row_len;
+
+            for x in &mut ll { *x = 0; }
+            for x in &mut d { *x = 0; }
+            ll[256] = 1;
+            let (e0, l0, d0) = eval.parse_slice(
+                tbl, &[], &win_buf[..w_bytes], row_len, bpp_u, &mut ll, &mut d, false, false,
+            );
+            let mut best_c = entropy_cost_bits(tbl, &ll, &d, 1 + l0, d0, e0);
+            let mut best_m = usize::MAX;
+
+            for m in 0..modes_lim {
+                if bank[m][y0 * row_len..y1 * row_len] == out[y0 * row_len..y1 * row_len] {
+                    continue;
+                }
+                win_buf[rel_off..rel_off + seg_bytes]
+                    .copy_from_slice(&bank[m][y0 * row_len..y1 * row_len]);
+                for x in &mut ll { *x = 0; }
+                for x in &mut d { *x = 0; }
+                ll[256] = 1;
+                let (e, l, dt) = eval.parse_slice(
+                    tbl, &[], &win_buf[..w_bytes], row_len, bpp_u, &mut ll, &mut d, false, false,
+                );
+                let c = entropy_cost_bits(tbl, &ll, &d, 1 + l, dt, e);
+                if c + 16.0 < best_c {
+                    best_c = c;
+                    best_m = m;
+                }
+            }
+            if best_m != usize::MAX {
+                out[y0 * row_len..y1 * row_len]
+                    .copy_from_slice(&bank[best_m][y0 * row_len..y1 * row_len]);
+            }
+        }
+    }
 }
 
 /// Exported multi-strategy native WASM filter generator!

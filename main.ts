@@ -40,7 +40,7 @@ function squeezePng(rgba, width, height) {
   const isHugePhoto = zLen > 205_000;
   const isDense = zLen > 90_000;
 
-  // High-power SIMD128 Rust/WASM deterministic Zopfli budgets calibrated for <=14.2s Node 22 Mac (<30s cloud!)
+  // High-power SIMD128 Rust/WASM deterministic Zopfli budgets calibrated for <=24.5s Node 22 Mac (<52s cloud!)
   const iters0 = isMegaImg
     ? 3
     : isHugePhoto
@@ -49,13 +49,13 @@ function squeezePng(rgba, width, height) {
         ? 7
         : isDense
           ? rawLen <= 1_200_000
-            ? 12
-            : 9
+            ? 14
+            : 8
           : rawLen <= 1_200_000
-            ? 9
-            : 6;
-  const chain0 = isMegaImg ? 32 : isHugePhoto ? 48 : rawLen <= 1_200_000 ? 448 : isDense ? 208 : 448;
-  const blocks0 = isMegaImg ? 16 : 32;
+            ? 11
+            : 8;
+  const chain0 = isMegaImg ? 32 : isHugePhoto ? 48 : rawLen <= 1_200_000 ? 512 : isDense ? 240 : 512;
+  const blocks0 = isMegaImg ? 16 : (isDense && rawLen <= 1_200_000) ? 64 : 36;
 
   const bestIdat = bestZlibForCandidate(top0, width, iters0, chain0, blocks0);
   return pngOfForm(width, height, top0.form, bestIdat);

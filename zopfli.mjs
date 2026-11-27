@@ -110,3 +110,18 @@ export function optimizePaletteTspWasm(idx, width, height, k, numTrans) {
     wasm.dealloc(inPtr, idx.length);
   }
 }
+
+export function polishFilterWasm(samples, base, width, height, bpp) {
+  const imgBytes = base.length;
+  const sPtr = copyToWasm(samples);
+  const bPtr = copyToWasm(base);
+  const oPtr = wasm.alloc(imgBytes);
+  try {
+    wasm.polish_filter_candidate(sPtr, bPtr, width, height, bpp, oPtr);
+    return new Uint8Array(wasm.memory.buffer, oPtr, imgBytes).slice();
+  } finally {
+    wasm.dealloc(oPtr, imgBytes);
+    wasm.dealloc(bPtr, imgBytes);
+    wasm.dealloc(sPtr, samples.length);
+  }
+}
