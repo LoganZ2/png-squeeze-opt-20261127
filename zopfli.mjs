@@ -36,6 +36,16 @@ export function zopfliZlib(data, { iterations = 20, maxChain = 384, maxBlocks = 
   }
 }
 
+export function fastZopfliScreenWasm(data, rowStride = 0, bpp = 1) {
+  const inLen = data.length;
+  const inPtr = copyToWasm(data);
+  try {
+    return wasm.fast_zopfli_screen(inPtr, inLen, rowStride, bpp) >>> 0;
+  } finally {
+    wasm.dealloc(inPtr, inLen);
+  }
+}
+
 export function fastLzLiteralCounts(data, rowStride = 0) {
   const inLen = data.length;
   const inPtr = copyToWasm(data);

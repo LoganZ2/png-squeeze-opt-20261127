@@ -1,6 +1,11 @@
 import { constants, deflateSync } from 'node:zlib';
 import { filterRow } from './png.mjs';
-import { fastLzLiteralCounts, generateFilterCandidatesWasm, optimizePaletteTspWasm } from './zopfli.mjs';
+import {
+  fastLzLiteralCounts,
+  fastZopfliScreenWasm,
+  generateFilterCandidatesWasm,
+  optimizePaletteTspWasm,
+} from './zopfli.mjs';
 
 function wordsOf(rgba) {
   const at = rgba.byteOffset % 4 === 0 ? rgba : rgba.slice();
@@ -234,17 +239,16 @@ const chunkBytes = (form) =>
   (form.plte === null ? 0 : 12 + form.plte.length) +
   (form.trns === null ? 0 : 12 + form.trns.length);
 
+const SCREEN_PAL = Object.freeze({ level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
 const SCREEN_HI = Object.freeze({ level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
-const SCREEN_LO = Object.freeze({ level: 5, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
-const RANK_DEF = Object.freeze({ level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
-const RANK_FILT = Object.freeze({ level: 9, memLevel: 8, strategy: constants.Z_FILTERED });
+const SCREEN_LO = Object.freeze({ level: 4, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
 
-export function screenCandidates(rgba, width, height, topK = 2) {
+export function screenCandidates(rgba, width, height, topK = 3) {
   const forms = formsOf(rgba, width, height);
   const pool = [];
-  const maxPool = Math.max(4, topK + 1);
+  const maxPool = Math.max(5, topK + 2);
 
-  const consider = (form, choice, data, zlibBuf, bytes) => {
+  const consider = (form, choice, data, estZlibBytes, bytes) => {
     for (let i = 0; i < pool.length; i++) {
       if (pool[i].bytes === bytes && pool[i].form === form) {
         const a = pool[i].data;
@@ -262,7 +266,7 @@ export function screenCandidates(rgba, width, height, topK = 2) {
         form,
         choice,
         data,
-        zlib: new Uint8Array(zlibBuf.buffer, zlibBuf.byteOffset, zlibBuf.length),
+        estBytes: estZlibBytes,
         bytes,
       });
       pool.sort((a, b) => a.bytes - b.bytes);
@@ -273,53 +277,70 @@ export function screenCandidates(rgba, width, height, topK = 2) {
   for (const form of forms) {
     const chunks = chunkBytes(form);
     if (form.colourType === 3) {
-      if (form.name === 'pal-count' || form.name === 'pal-bcooccur') {
-        const cands = generateFilterCandidatesWasm(form.samples, width, height, 1, 2, 3);
-        const names = ['band24', '0', '1'];
+      if (form.name === 'pal-count') {
+        const cands = generateFilterCandidatesWasm(form.samples, width, height, 1, 2, 4);
+        const names = ['eu0', 'band24', '0', '1'];
         for (let m = 0; m < cands.length; m++) {
-          const z = deflateSync(cands[m], SCREEN_HI);
-          consider(form, names[m], cands[m], z, z.length + chunks);
+          const z = deflateSync(cands[m], SCREEN_PAL).length;
+          consider(form, names[m], cands[m], z, z + chunks);
+        }
+      } else if (form.name === 'pal-lzfreq' || form.name === 'pal-bcooccur') {
+        const cands = generateFilterCandidatesWasm(form.samples, width, height, 1, 3, 2);
+        const names = ['eu0', '0'];
+        for (let m = 0; m < cands.length; m++) {
+          const z = deflateSync(cands[m], SCREEN_PAL).length;
+          consider(form, names[m], cands[m], z, z + chunks);
         }
       } else {
         const modes = form.name === 'pal-cooccur' ? [0, 1] : [0];
         for (const m of modes) {
           const buf = buildFixedRowMode(form.samples, width, height, m);
-          const z = deflateSync(buf, SCREEN_HI);
-          consider(form, String(m), buf, z, z.length + chunks);
+          const z = deflateSync(buf, SCREEN_PAL).length;
+          consider(form, String(m), buf, z, z + chunks);
         }
       }
       continue;
     }
 
-    // Native WASM returns elite finalists including exact-Huffman Viterbi DP!
+    // Native WASM returns elite finalists including split fine/macro Viterbi DP & adaptive LZ-Row!
     const mode = form.bpp <= 2 ? 1 : 0;
-    const cands = generateFilterCandidatesWasm(form.samples, width, height, form.bpp, mode, 5);
-    const names = mode === 1 ? ['band16', 'viterbi', 'lzrow', '0', '4'] : ['band40', 'viterbi', 'lzrow', '0', '4'];
+    const cands = generateFilterCandidatesWasm(form.samples, width, height, form.bpp, mode, 6);
+    const names = mode === 1 ? ['band16', 'viterbi', 'lzrow', '0', '4', 'vitM'] : ['band40', 'viterbi', 'lzrow', '0', '4', 'vitM'];
     const sOpt = form.bpp <= 2 ? SCREEN_HI : SCREEN_LO;
     for (let m = 0; m < cands.length; m++) {
-      const z = deflateSync(cands[m], sOpt);
-      consider(form, names[m] ?? `w${m}`, cands[m], z, z.length + chunks);
+      const z = deflateSync(cands[m], sOpt).length;
+      consider(form, names[m] ?? `w${m}`, cands[m], z, z + chunks);
     }
   }
 
-  const rankLim = Math.min(3, pool.length);
-  const topScreenBytes = pool.length > 0 ? pool[0].bytes : Infinity;
-  for (let i = 0; i < rankLim; i++) {
-    const c = pool[i];
-    if (i > 0 && c.bytes > topScreenBytes * 1.015) continue;
-    const ch = chunkBytes(c.form);
-    const zd = deflateSync(c.data, RANK_DEF);
-    let bestZ = zd;
-    if (i === 0 && zd.length > 90_000) {
-      const zf = deflateSync(c.data, RANK_FILT);
-      if (zf.length < bestZ.length) bestZ = zf;
+  // Hybrid Zopfli-aligned WASM tie-breaker: when non-palette #2 is within 3.0% of #1 and not a dense photo,
+  // re-rank top 4 close finalists with native WASM fast_zopfli_screen (eliminates zlib-vs-Zopfli rank inversions!).
+  if (
+    pool.length > 1 &&
+    pool[0].form.colourType !== 3 &&
+    pool[0].estBytes <= 135_000 &&
+    pool[1].bytes <= pool[0].bytes * 1.03
+  ) {
+    const topScreenBytes = pool[0].bytes;
+    const lim = Math.min(pool[0].form.bpp === 1 ? 3 : 5, pool.length);
+    const tol = pool[0].form.bpp === 1 ? 1.02 : 1.03;
+    for (let i = 0; i < lim; i++) {
+      const c = pool[i];
+      if (i > 0 && c.bytes > topScreenBytes * tol) break;
+      if (i > 0 && c.form.bpp > 1 && (c.choice === '0' || c.choice === '4')) continue;
+      const z = fastZopfliScreenWasm(c.data, width * c.form.bpp + 1, c.form.bpp);
+      c.zopScreen = z + chunkBytes(c.form);
     }
-    const bestB = bestZ.length + ch;
-    if (bestB < c.bytes) {
-      c.zlib = new Uint8Array(bestZ.buffer, bestZ.byteOffset, bestZ.length);
-      c.bytes = bestB;
+    const scored = [];
+    const unscored = [];
+    for (let i = 0; i < pool.length; i++) {
+      if (pool[i].zopScreen !== undefined) scored.push(pool[i]);
+      else unscored.push(pool[i]);
     }
+    scored.sort((a, b) => a.zopScreen - b.zopScreen);
+    pool.length = 0;
+    pool.push(...scored, ...unscored);
   }
-  pool.sort((a, b) => a.bytes - b.bytes);
+
   return pool.slice(0, topK);
 }
