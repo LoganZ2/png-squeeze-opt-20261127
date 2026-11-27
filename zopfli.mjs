@@ -17,7 +17,7 @@ const DIST_EXTRA = Uint8Array.of(
   7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
 );
 const CL_ORDER = Uint8Array.of(16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);
-const LONG_LEN_STOPS = Uint16Array.of(16, 18, 20, 24, 30, 34, 42, 50, 58, 66, 82, 98, 114, 130, 162, 194, 226);
+const LONG_LEN_STOPS = Uint16Array.of(14, 18, 26, 34, 50, 66, 98, 130, 162, 194, 226);
 const FINAL_LEN_STOPS = Uint16Array.of(
   40, 42, 44, 48, 50, 56, 58, 64, 66, 72, 80, 82, 96, 98, 112, 114, 128, 130, 144, 160, 162, 176, 192, 194, 208, 224, 226, 240
 );
@@ -717,7 +717,8 @@ function findBestSplitFast(litLens, dists, l, r) {
   const numPts = 11;
   let lo = l, hi = r, bestPos = -1, bestCost = Infinity;
   let lastStep = 64;
-  while (hi - lo > 64) {
+  let rounds = 0;
+  while (hi - lo > 64 && rounds++ < 16) {
     const step = (hi - lo) / (numPts + 1);
     lastStep = Math.max(24, Math.floor(step));
     let localBest = -1, localCost = Infinity;
@@ -872,27 +873,72 @@ function precomputeBlockMatches(
     const limit = p > WIN_SIZE ? p - WIN_SIZE : 0;
     const b0 = data[p], b1 = data[p + 1], b2 = data[p + 2];
     const myRun = runLeft[p];
+    const rowLenAbove = runRow !== null ? (runRow[p] < maxLen ? runRow[p] : maxLen) : 0;
+    const useRleHash = myRun >= 3 && myRun < maxLen && p + myRun < n;
 
-    let maxFound = 2;
-    const record = (l, dist) => {
-      if (l > maxFound) {
-        for (let k = maxFound + 1; k <= l; k++) minDist[k] = dist;
-        maxFound = l;
+    // ZERO-ALLOCATION O(1) FAST PATH when no out-of-order sources (rowAbove / RLE hash) exist!
+    // Primary 3-byte hash walks strictly nearest-to-farthest, so every l > bestL is already Pareto-optimal!
+    if (!useRleHash && rowLenAbove < 3) {
+      let bestL = 2;
+      let steps = 0;
+      if (p > 0 && data[p - 1] === b0 && myRun >= 3) {
+        bestL = myRun < maxLen ? myRun : maxLen;
+        tmpLen[steps] = bestL; tmpDist[steps] = 1; steps++;
       }
-      for (let k = l; k >= 3 && dist < minDist[k]; k--) minDist[k] = dist;
-    };
+      if (runBpp !== null && runBpp[p] > bestL) {
+        const rb = runBpp[p] < maxLen ? runBpp[p] : maxLen;
+        if (rb > bestL) { bestL = rb; tmpLen[steps] = rb; tmpDist[steps] = bpp; steps++; }
+      }
+      const h = hash3(data, p);
+      let cand = head[h];
+      let chain = maxChain;
+      while (cand >= limit && chain-- > 0 && bestL < maxLen) {
+        if (data[cand + bestL] === data[p + bestL] && data[cand] === b0 && data[cand + 1] === b1 && data[cand + 2] === b2) {
+          let l = 3;
+          while (l < maxLen && data[cand + l] === data[p + l]) l++;
+          if (l > bestL) {
+            bestL = l; tmpLen[steps] = l; tmpDist[steps] = p - cand; steps++;
+            if (bestL === maxLen) break;
+            if (bestL >= 48 && chain > 12) chain = 12;
+            else if (bestL >= 24 && chain > 32) chain = 32;
+          }
+        }
+        const next = prev[cand & WIN_MASK];
+        if (next >= cand) break;
+        cand = next;
+      }
+      const r2 = rowStride * 2;
+      if (bestL < maxLen && rowStride > 1 && r2 <= WIN_SIZE && p >= r2) {
+        const rc = p - r2;
+        if (data[rc + bestL] === data[p + bestL] && data[rc] === b0 && data[rc + 1] === b1 && data[rc + 2] === b2) {
+          let l = 3;
+          while (l < maxLen && data[rc + l] === data[p + l]) l++;
+          if (l > bestL) { bestL = l; tmpLen[steps] = l; tmpDist[steps] = r2; steps++; }
+        }
+      }
+      insertHashes(p);
+      if (steps > 0) {
+        ensureMatch(steps);
+        for (let s = 0; s < steps; s++) { mLen[mCnt] = tmpLen[s]; mDist[mCnt] = tmpDist[s]; mCnt++; }
+      }
+      continue;
+    }
 
+    // Exact Pareto minDist[3..258] path (ZERO closure allocations!) when rowAbove or RLE hash is active
+    let maxFound = 2;
     if (p > 0 && data[p - 1] === b0 && myRun >= 3) {
-      record(myRun < maxLen ? myRun : maxLen, 1);
+      const rl = myRun < maxLen ? myRun : maxLen;
+      for (let k = 3; k <= rl; k++) minDist[k] = 1;
+      maxFound = rl;
     }
     if (runBpp !== null && runBpp[p] >= 3) {
-      record(runBpp[p] < maxLen ? runBpp[p] : maxLen, bpp);
+      const rb = runBpp[p] < maxLen ? runBpp[p] : maxLen;
+      if (rb > maxFound) { for (let k = maxFound + 1; k <= rb; k++) minDist[k] = bpp; maxFound = rb; }
+      for (let k = rb; k >= 3 && bpp < minDist[k]; k--) minDist[k] = bpp;
     }
-
-    // Check row-above match (fast O(1) lookup via runRow!)
-    const rowLenAbove = runRow !== null ? (runRow[p] < maxLen ? runRow[p] : maxLen) : 0;
     if (rowLenAbove >= 3) {
-      record(rowLenAbove, rowStride);
+      if (rowLenAbove > maxFound) { for (let k = maxFound + 1; k <= rowLenAbove; k++) minDist[k] = rowStride; maxFound = rowLenAbove; }
+      for (let k = rowLenAbove; k >= 3 && rowStride < minDist[k]; k--) minDist[k] = rowStride;
     }
 
     // Fast path 3: Identical row-above full match -> only walk closer candidates (< rowStride) to improve dist!
@@ -900,7 +946,7 @@ function precomputeBlockMatches(
       const closeLimit = p - rowStride + 1;
       const h = hash3(data, p);
       let cand = head[h];
-      let chain = 24;
+      let chain = 20;
       let closeBest = minDist[3] < rowStride ? 3 : 2;
       while (closeBest < maxLen && minDist[closeBest + 1] < rowStride) closeBest++;
       while (cand >= closeLimit && chain-- > 0 && closeBest < maxLen) {
@@ -909,7 +955,8 @@ function precomputeBlockMatches(
           while (l < maxLen && data[cand + l] === data[p + l]) l++;
           if (l > closeBest) {
             closeBest = l;
-            record(l, p - cand);
+            const d = p - cand;
+            for (let k = l; k >= 3 && d < minDist[k]; k--) minDist[k] = d;
           }
         }
         const next = prev[cand & WIN_MASK];
@@ -929,12 +976,10 @@ function precomputeBlockMatches(
     }
 
     // Primary 3-byte hash walk FIRST (strictly nearest-to-farthest -> preserves all close matches!)
-    const useRleHash = myRun >= 3 && myRun < maxLen && p + myRun < n;
     const h = hash3(data, p);
     {
       let cand = head[h];
-      let chain = useRleHash ? Math.min(96, maxChain >>> 1) : maxChain;
-      // Track bestL found at distances <= current cand (rowStride might already be recorded at a farther dist!)
+      let chain = useRleHash ? Math.min(64, maxChain >>> 1) : maxChain;
       let closeBest = 2;
       if (p > 0 && data[p - 1] === b0 && myRun >= 3) closeBest = myRun < maxLen ? myRun : maxLen;
       if (runBpp !== null && runBpp[p] > closeBest) closeBest = runBpp[p] < maxLen ? runBpp[p] : maxLen;
@@ -947,10 +992,11 @@ function precomputeBlockMatches(
           while (l < maxLen && data[cand + l] === data[p + l]) l++;
           if (l > closeBest) {
             closeBest = l;
-            record(l, dist);
+            if (l > maxFound) { for (let k = maxFound + 1; k <= l; k++) minDist[k] = dist; maxFound = l; }
+            for (let k = l; k >= 3 && dist < minDist[k]; k--) minDist[k] = dist;
             if (closeBest === maxLen) break;
-            if (closeBest >= 64 && chain > 16) chain = 16;
-            else if (closeBest >= 24 && chain > 48) chain = 48;
+            if (closeBest >= 48 && chain > 12) chain = 12;
+            else if (closeBest >= 24 && chain > 32) chain = 32;
           }
         }
         const next = prev[cand & WIN_MASK];
@@ -967,7 +1013,6 @@ function precomputeBlockMatches(
       let rleBest = myRun;
       while (cand >= limit && chain2-- > 0 && rleBest < maxLen) {
         const dist = p - cand;
-        // Skip only if we already have an equal-or-closer match of length > rleBest
         if (
           runLeft[cand] === myRun &&
           data[cand] === b0 &&
@@ -978,7 +1023,8 @@ function precomputeBlockMatches(
           while (l < maxLen && data[cand + l] === data[p + l]) l++;
           if (l > rleBest) {
             rleBest = l;
-            record(l, dist);
+            if (l > maxFound) { for (let k = maxFound + 1; k <= l; k++) minDist[k] = dist; maxFound = l; }
+            for (let k = l; k >= 3 && dist < minDist[k]; k--) minDist[k] = dist;
             if (rleBest === maxLen) break;
           }
         }
@@ -995,7 +1041,8 @@ function precomputeBlockMatches(
       if (data[rc] === b0 && data[rc + 1] === b1 && data[rc + 2] === b2) {
         let l = 3;
         while (l < maxLen && data[rc + l] === data[p + l]) l++;
-        record(l, r2);
+        if (l > maxFound) { for (let k = maxFound + 1; k <= l; k++) minDist[k] = r2; maxFound = l; }
+        for (let k = l; k >= 3 && r2 < minDist[k]; k--) minDist[k] = r2;
       }
     }
 
@@ -1068,16 +1115,16 @@ function optimalParseBlock(
       const dist = mDist[s];
       const base = c + distFullCost[DIST_SYM[dist]];
       const startL = endL > prevL ? prevL + 1 : 3;
-      if ((exactAllLengths === 2) || endL <= (exactAllLengths === 1 ? 36 : 14)) {
+      if ((exactAllLengths === 2) || endL <= (exactAllLengths === 1 ? 32 : 12)) {
         for (let l = startL; l <= endL; l++) {
           const mc = base + lenFullCost[l];
           const ni = rel + l;
           if (mc < dpCost[ni]) { dpCost[ni] = mc; dpLen[ni] = l; dpDist[ni] = dist; }
         }
       } else {
-        const denseLim = exactAllLengths === 1 ? 36 : 14;
+        const denseLim = exactAllLengths === 1 ? 32 : 12;
         const stops = exactAllLengths === 1 ? FINAL_LEN_STOPS : LONG_LEN_STOPS;
-        const tailPad = exactAllLengths === 1 ? 4 : 2;
+        const tailPad = exactAllLengths === 1 ? 3 : 1;
         const denseEnd = denseLim < endL ? denseLim : endL;
         for (let l = startL; l <= denseEnd; l++) {
           const mc = base + lenFullCost[l];
@@ -1335,16 +1382,12 @@ export function zopfliZlib(data, { iterations = 13, maxChain = 448, maxBlocks = 
           const te = subSplits[s + 1];
           const rawStart = res.posArr[ts];
           const rawEnd = te < res.tokCnt ? res.posArr[te] : bEnd;
-          const initSub = { litLens: res.litLens.subarray(ts, te), dists: res.dists.subarray(ts, te) };
-          if (data.length > 1_200_000 || iterations <= 6) {
-            finalBlocks.push({ litLens: initSub.litLens, dists: initSub.dists, rawStart, rawEnd });
-          } else {
-            const reopt = zopfliOptimizeRange(
-              data, runLeft, runBpp, bpp, bStart, bEnd,
-              matches, 1, dpCost, dpLen, dpDist, rawStart - bStart, rawEnd - bStart, initSub
-            );
-            finalBlocks.push({ litLens: reopt.litLens, dists: reopt.dists, rawStart, rawEnd });
-          }
+          finalBlocks.push({
+            litLens: res.litLens.subarray(ts, te),
+            dists: res.dists.subarray(ts, te),
+            rawStart,
+            rawEnd,
+          });
         }
       } else {
         finalBlocks.push({ litLens: res.litLens, dists: res.dists, rawStart: bStart, rawEnd: bEnd });
@@ -1357,7 +1400,8 @@ export function zopfliZlib(data, { iterations = 13, maxChain = 448, maxBlocks = 
   // Stage 3: Adjacent block merge check
   let merged = finalBlocks;
   let didMerge = true;
-  while (didMerge && merged.length > 1) {
+  let mergeGuard = 0;
+  while (didMerge && merged.length > 1 && mergeGuard++ < 32) {
     didMerge = false;
     const next = [];
     for (let i = 0; i < merged.length; ) {
