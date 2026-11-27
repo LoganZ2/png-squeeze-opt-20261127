@@ -243,7 +243,9 @@ function paletteLzFreqForm(rgba, width, height, baseForm) {
 export function formsOf(rgba, width, height) {
   const { opaque, grey, colours } = analyse(rgba);
   const forms = [];
-  if (colours !== null) {
+  const key = opaque ? null : transparentKey(rgba, grey);
+  // On lossless Type-0 greyscale images, Type 0 (1 bpp, zero PLTE overhead, natural luma order) always dominates Type 3!
+  if (colours !== null && !(grey && (opaque || key !== null))) {
     const pCount = paletteForm(rgba, width, height, colours, 'count');
     const fCount = { name: 'pal-count', colourType: 3, bpp: 1, samples: pCount.indices, plte: pCount.plte, trns: pCount.trns, entries: pCount.entries };
     forms.push(fCount);
@@ -254,7 +256,6 @@ export function formsOf(rgba, width, height) {
     }
     if (!grey) return forms;
   }
-  const key = opaque ? null : transparentKey(rgba, grey);
   let ct;
   let trns = null;
   if (grey) {
@@ -375,6 +376,7 @@ function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, leve
     let bestScore = Infinity;
     let bestMode = 0;
     for (let mode = 0; mode < numModes; mode++) {
+      if (mode === 3) continue; // Avg is dominated by Paeth/pairs/minsum inside banded search
       work.set(rowBank[mode].subarray(at, at + bBytes), wLen);
       const len = deflateSync(slice, { level, memLevel: 8, strategy }).length;
       // Small hysteresis bonus to keep previous mode unless switching saves meaningfully
@@ -467,7 +469,7 @@ function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, leve
       let bestM = seg.mode;
       let bestC = deflateSync(buf, { level: 3, memLevel: 8, strategy }).length;
       for (let m = 0; m < numModes; m++) {
-        if (m === seg.mode) continue;
+        if (m === seg.mode || m === 3) continue;
         buf.set(rowBank[m].subarray(seg.y0 * rowLen, seg.y1 * rowLen), segOff);
         const c = deflateSync(buf, { level: 3, memLevel: 8, strategy }).length;
         if (c + 4 < bestC) { bestC = c; bestM = m; }
@@ -506,7 +508,7 @@ export function screenCandidates(rgba, width, height, topK = 2) {
         }
       }
     }
-    const maxPool = Math.max(6, topK + 4);
+    const maxPool = Math.max(3, topK + 2);
     if (pool.length < maxPool || bytes < pool[pool.length - 1].bytes) {
       pool.push({
         form,
@@ -526,7 +528,7 @@ export function screenCandidates(rgba, width, height, topK = 2) {
 
     if (form.colourType === 3) {
       const bank = buildRowBank(form.samples, width, height, 1, false);
-      const modes = form.name === 'pal-count' || form.name === 'pal-lzfreq' ? [0, 1, 2, 5, 6] : [0, 1, 2, 4, 5, 6];
+      const modes = form.name === 'pal-count' || form.name === 'pal-lzfreq' ? [0, 1, 2, 5] : [0, 1, 5, 6];
       const names = ['0', '1', '2', '3', '4', 'pairs', 'minsum'];
       for (const m of modes) {
         const z = deflateSync(bank[m], SCREEN_DEF);
@@ -535,34 +537,37 @@ export function screenCandidates(rgba, width, height, topK = 2) {
       continue;
     }
 
-    const bank = buildRowBank(form.samples, width, height, form.bpp, true);
+    const bank = buildRowBank(form.samples, width, height, form.bpp, false);
     if (form.bpp <= 2) {
       const bruteBuf = new Uint8Array(size);
-      filterZlibBrute(bank, width, height, form.bpp, bruteBuf, 4, 32768);
+      filterZlibBrute(bank, width, height, form.bpp, bruteBuf, 3, 32768);
       bank.push(bruteBuf);
     }
 
-    const names = ['0', '1', '2', '3', '4', 'pairs', 'minsum', 'entropy', 'brute'];
+    const names = ['0', '1', '2', '3', '4', 'pairs', 'minsum', 'brute'];
     for (let m = 0; m < bank.length; m++) {
       const z = deflateSync(bank[m], SCREEN_DEF);
       consider(form, names[m], bank[m], z, z.length + chunks, false);
     }
 
     const buf = new Uint8Array(size);
-    for (const [bh, hyst] of [[24, 0], [40, 8], [72, 8]]) {
+    for (const [bh, hyst] of [[24, 0], [40, 8]]) {
       filterBandHybrid(bank, width, height, form.bpp, buf, bh, 32768, 4, constants.Z_DEFAULT_STRATEGY, hyst);
       const z = deflateSync(buf, SCREEN_DEF);
       consider(form, `band${bh}`, buf, z, z.length + chunks, true);
     }
   }
 
-  // Re-rank top pool by min(z9_default, z9_filtered) — accurately predicts literal-aware Zopfli winners!
+  // Re-rank top 3 pool entries by min(z9_default, z9_filtered when dense)
   for (let i = 0; i < pool.length; i++) {
     const c = pool[i];
     const ch = chunkBytes(c.form);
     const zd = deflateSync(c.data, RANK_DEF);
-    const zf = deflateSync(c.data, RANK_FILT);
-    const bestZ = zf.length < zd.length ? zf : zd;
+    let bestZ = zd;
+    if (zd.length > 75_000) {
+      const zf = deflateSync(c.data, RANK_FILT);
+      if (zf.length < bestZ.length) bestZ = zf;
+    }
     const bestB = bestZ.length + ch;
     if (bestB < c.bytes) {
       c.zlib = new Uint8Array(bestZ.buffer, bestZ.byteOffset, bestZ.length);

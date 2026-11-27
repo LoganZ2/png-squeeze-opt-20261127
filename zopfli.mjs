@@ -1065,20 +1065,20 @@ function optimalParseBlock(
       const dist = mDist[s];
       const base = c + distFullCost[DIST_SYM[dist]];
       const startL = endL > prevL ? prevL + 1 : 3;
-      if (exactAllLengths || endL <= 26) {
+      if (exactAllLengths || endL <= 20) {
         for (let l = startL; l <= endL; l++) {
           const mc = base + lenFullCost[l];
           const ni = rel + l;
           if (mc < dpCost[ni]) { dpCost[ni] = mc; dpLen[ni] = l; dpDist[ni] = dist; }
         }
       } else {
-        const denseEnd = 26 < endL ? 26 : endL;
+        const denseEnd = 20 < endL ? 20 : endL;
         for (let l = startL; l <= denseEnd; l++) {
           const mc = base + lenFullCost[l];
           const ni = rel + l;
           if (mc < dpCost[ni]) { dpCost[ni] = mc; dpLen[ni] = l; dpDist[ni] = dist; }
         }
-        const loStop = startL > 27 ? startL : 27;
+        const loStop = startL > 21 ? startL : 21;
         const hiStop = endL - 3;
         for (let k = 0; k < LONG_LEN_STOPS.length; k++) {
           const l = LONG_LEN_STOPS[k];
@@ -1208,7 +1208,7 @@ function zopfliOptimizeRange(
 
   let lastImproved = false;
   for (let iter = 0; iter < iterations; iter++) {
-    const isExactLengths = data.length <= 1_200_000 ? iter >= iterations - 2 : iter === iterations - 1;
+    const isExactLengths = iter === iterations - 1;
     const isExactHeader = iter >= iterations - 2;
     const { litLens, dists, posArr, tokCnt } = optimalParseBlock(
       data, runLeft, runBpp, bpp, bStart, bEnd,
@@ -1260,8 +1260,8 @@ function zopfliOptimizeRange(
     }
   }
 
-  // Bonus exact-Huffman continuation pass only when 1-bpp (fast!) or substantial bit gain (> 64 bits)
-  if (lastImproved && bestDyn !== null && iterations >= 6 && (data.length <= 1_200_000 || lastBits - bestBits > 64)) {
+  // Bonus exact-Huffman continuation pass only when 1-bpp (fast!) or substantial bit gain (> 256 bits)
+  if (lastImproved && bestDyn !== null && iterations >= 6 && (data.length <= 1_200_000 || lastBits - bestBits > 256)) {
     for (let i = 0; i < 286; i++) llCost[i] = bestDyn.llLens[i] > 0 ? bestDyn.llLens[i] : 16;
     for (let i = 0; i < 30; i++) dCost[i] = bestDyn.dLens[i] > 0 ? bestDyn.dLens[i] : 16;
     const { litLens, dists, posArr, tokCnt } = optimalParseBlock(
@@ -1320,8 +1320,8 @@ export function zopfliZlib(data, { iterations = 13, maxChain = 448, maxBlocks = 
       data, runLeft, runBpp, bpp, bStart, bEnd, matches, iterations, dpCost, dpLen, dpDist
     );
 
-    if (res.tokCnt >= 512) {
-      const subSplits = splitTokenStream(res.litLens, res.dists, res.tokCnt, 8, 192);
+    if (res.tokCnt >= 768) {
+      const subSplits = splitTokenStream(res.litLens, res.dists, res.tokCnt, 6, 256);
       if (subSplits.length > 2) {
         for (let s = 0; s < subSplits.length - 1; s++) {
           const ts = subSplits[s];
@@ -1329,11 +1329,15 @@ export function zopfliZlib(data, { iterations = 13, maxChain = 448, maxBlocks = 
           const rawStart = res.posArr[ts];
           const rawEnd = te < res.tokCnt ? res.posArr[te] : bEnd;
           const initSub = { litLens: res.litLens.subarray(ts, te), dists: res.dists.subarray(ts, te) };
-          const reopt = zopfliOptimizeRange(
-            data, runLeft, runBpp, bpp, bStart, bEnd,
-            matches, 3, dpCost, dpLen, dpDist, rawStart - bStart, rawEnd - bStart, initSub
-          );
-          finalBlocks.push({ litLens: reopt.litLens, dists: reopt.dists, rawStart, rawEnd });
+          if (iterations <= 7) {
+            finalBlocks.push({ litLens: initSub.litLens, dists: initSub.dists, rawStart, rawEnd });
+          } else {
+            const reopt = zopfliOptimizeRange(
+              data, runLeft, runBpp, bpp, bStart, bEnd,
+              matches, 2, dpCost, dpLen, dpDist, rawStart - bStart, rawEnd - bStart, initSub
+            );
+            finalBlocks.push({ litLens: reopt.litLens, dists: reopt.dists, rawStart, rawEnd });
+          }
         }
       } else {
         finalBlocks.push({ litLens: res.litLens, dists: res.dists, rawStart: bStart, rawEnd: bEnd });

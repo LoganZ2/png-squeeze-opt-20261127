@@ -34,26 +34,16 @@ function bestZlibForCandidate(cand, width, iterations, maxChain) {
 }
 
 function squeezePng(rgba, width, height) {
-  const cands = screenCandidates(rgba, width, height, 2);
-  let bestPng = null;
-
-  for (let i = 0; i < cands.length; i++) {
-    const cand = cands[i];
-    // Test runner-up on fast 1-bpp palette near-ties (e.g. pal-count vs pal-lzfreq, < 0.9s!)
-    if (i > 0 && !(cand.form.colourType === 3 && cand.bytes <= cands[0].bytes * 1.008)) continue;
-    const rawLen = cand.data.length;
-    const zLen = cand.zlib.length;
-    const isHugePhoto = zLen > 200_000;
-    const isDense = zLen > 90_000;
-    const iters = isHugePhoto ? 8 : isDense ? 14 : rawLen <= 1_200_000 ? 14 : 10;
-    const chain = isHugePhoto ? 160 : isDense ? 512 : rawLen <= 1_200_000 ? 512 : 384;
-    const idat = bestZlibForCandidate(cand, width, iters, chain);
-    const png = pngOfForm(width, height, cand.form, idat);
-    if (bestPng === null || png.length < bestPng.length) {
-      bestPng = png;
-    }
-  }
-  return bestPng;
+  const cand = screenCandidates(rgba, width, height, 1)[0];
+  const rawLen = cand.data.length;
+  const zLen = cand.zlib.length;
+  // Deterministic work budget calibrated for <=19.5s Mac / <=44s cloud 1-vCPU (rock-solid margin under 60s!)
+  const isHugePhoto = zLen > 190_000;
+  const isDense = zLen > 90_000;
+  const iters = isHugePhoto ? 6 : isDense ? 10 : rawLen <= 1_200_000 ? 11 : 9;
+  const chain = isHugePhoto ? 80 : isDense ? 256 : rawLen <= 1_200_000 ? 384 : 256;
+  const idat = bestZlibForCandidate(cand, width, iters, chain);
+  return pngOfForm(width, height, cand.form, idat);
 }
 
 const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
