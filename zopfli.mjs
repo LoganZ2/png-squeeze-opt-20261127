@@ -49,20 +49,21 @@ export function fastLzLiteralCounts(data, rowStride = 0) {
   }
 }
 
-export function generateFilterCandidatesWasm(samples, width, height, bpp, includeBrute = false, topK = 3) {
+export function generateFilterCandidatesWasm(samples, width, height, bpp, mode = 0, topK = 5) {
   const rowLen = width * bpp + 1;
   const imgBytes = height * rowLen;
   const maxCands = topK;
   const inPtr = copyToWasm(samples);
   const outBytes = imgBytes * maxCands;
   const outPtr = wasm.alloc(outBytes);
+  const modeInt = typeof mode === 'boolean' ? (mode ? 1 : 0) : mode | 0;
   try {
     const count = wasm.generate_filter_candidates(
       inPtr,
       width,
       height,
       bpp,
-      includeBrute ? 1 : 0,
+      modeInt,
       outPtr,
       maxCands
     );

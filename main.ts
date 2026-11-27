@@ -44,21 +44,21 @@ function squeezePng(rgba, width, height) {
   const isHugePhoto = zLen > 220_000;
   const isDense = zLen > 90_000;
 
-  // High-power native Rust/WASM deterministic Zopfli budgets calibrated for <=9.5s Node 22 Mac (~22s cloud!)
-  const iters0 = isHugePhoto ? 4 : rawLen <= 1_200_000 ? 9 : isDense ? 8 : 7;
-  const chain0 = isHugePhoto ? 48 : rawLen <= 1_200_000 ? 224 : 160;
-  const blocks0 = 24;
+  // High-power SIMD128 Rust/WASM deterministic Zopfli budgets calibrated for <=14.5s Node 22 Mac (~32s cloud!)
+  const iters0 = isHugePhoto ? 4 : rawLen <= 1_200_000 ? 13 : 9;
+  const chain0 = isHugePhoto ? 48 : rawLen <= 1_200_000 ? 352 : isDense ? 208 : 240;
+  const blocks0 = 32;
 
   let bestForm = top0.form;
   let bestIdat = bestZlibForCandidate(top0, width, iters0, chain0, blocks0);
   let bestTotal = bestIdat.length + chunkOverhead(bestForm);
 
-  // Run Rust Zopfli on tiny razor-close palette tie only (<20 KB & within 0.2%)
-  if (finalists.length > 1 && zLen < 20_000) {
+  // Run Rust Zopfli on tiny razor-close palette tie (<15 KB & within 0.1%)
+  if (finalists.length > 1 && zLen < 15_000) {
     const cand = finalists[1];
     const gap = (cand.bytes - top0.bytes) / Math.max(1, top0.bytes);
-    if (gap <= 0.002) {
-      const idat = bestZlibForCandidate(cand, width, 8, 192, blocks0);
+    if (gap <= 0.001) {
+      const idat = bestZlibForCandidate(cand, width, 10, 256, blocks0);
       const total = idat.length + chunkOverhead(cand.form);
       if (total < bestTotal) {
         bestTotal = total;

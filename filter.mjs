@@ -82,7 +82,7 @@ function buildPaletteFromEntries(rgba, entries) {
   return { plte, trns, indices, entries };
 }
 
-function cooccurrenceOrder(rgba, width, height, colours) {
+function cooccurrenceOrder(rgba, width, height, colours, lockBorderZero = false) {
   const k = colours.length;
   const sorted = [...colours].sort((x, y) => {
     const ta = x.rgba[3] === 255 ? 1 : 0;
@@ -101,7 +101,28 @@ function cooccurrenceOrder(rgba, width, height, colours) {
   const idx = new Uint8Array(width * height);
   for (let i = 0; i < idx.length; i++) idx[i] = idMap.get(u32[i]);
 
-  const order = optimizePaletteTspWasm(idx, width, height, k, numTrans);
+  let lockedPrefix = numTrans;
+  if (lockBorderZero && numTrans === 0 && k > 2) {
+    const edgeCnt = new Int32Array(k);
+    for (let y = 0; y < height; y++) {
+      edgeCnt[idx[y * width]]++;
+      edgeCnt[idx[(y + 1) * width - 1]]++;
+    }
+    let bIdx = 0, bestE = -1;
+    for (let i = 0; i < k; i++) {
+      if (edgeCnt[i] > bestE) { bestE = edgeCnt[i]; bIdx = i; }
+    }
+    if (bIdx !== 0) {
+      const tmp = sorted[0]; sorted[0] = sorted[bIdx]; sorted[bIdx] = tmp;
+      for (let i = 0; i < idx.length; i++) {
+        if (idx[i] === 0) idx[i] = bIdx;
+        else if (idx[i] === bIdx) idx[i] = 0;
+      }
+    }
+    lockedPrefix = 1;
+  }
+
+  const order = optimizePaletteTspWasm(idx, width, height, k, lockedPrefix);
   const out = new Array(k);
   for (let i = 0; i < k; i++) out[i] = sorted[order[i]];
   return out;
@@ -109,7 +130,8 @@ function cooccurrenceOrder(rgba, width, height, colours) {
 
 function paletteForm(rgba, width, height, colours, order) {
   let entries;
-  if (order === 'cooccur') entries = cooccurrenceOrder(rgba, width, height, colours);
+  if (order === 'cooccur') entries = cooccurrenceOrder(rgba, width, height, colours, false);
+  else if (order === 'bcooccur') entries = cooccurrenceOrder(rgba, width, height, colours, true);
   else {
     const lum = (c) => 299 * c.rgba[0] + 587 * c.rgba[1] + 114 * c.rgba[2];
     entries = [...colours].sort((x, y) => {
@@ -175,7 +197,7 @@ export function formsOf(rgba, width, height) {
     const fCount = { name: 'pal-count', colourType: 3, bpp: 1, samples: pCount.indices, plte: pCount.plte, trns: pCount.trns, entries: pCount.entries };
     forms.push(fCount);
     for (const f of paletteLzFreqForms(rgba, width, height, fCount)) forms.push(f);
-    for (const order of ['luminance', 'cooccur']) {
+    for (const order of ['bcooccur', 'cooccur', 'luminance']) {
       const p = paletteForm(rgba, width, height, colours, order);
       forms.push({ name: `pal-${order}`, colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, entries: p.entries });
     }
@@ -195,45 +217,17 @@ export function formsOf(rgba, width, height) {
   return forms;
 }
 
-function signedSum(row) {
-  let s = 0;
-  for (let i = 0; i < row.length; i++) { const v = row[i]; s += v < 128 ? v : 256 - v; }
-  return s;
-}
-
-function pairsOf(row, seen, stamp) {
-  let n = 0;
-  for (let i = 1; i < row.length; i++) {
-    const p = (row[i - 1] << 8) | row[i];
-    if (seen[p] !== stamp) { seen[p] = stamp; n++; }
-  }
-  return n;
-}
-
-function buildPaletteRowBank(samples, w, h) {
+function buildFixedRowMode(samples, w, h, mode) {
   const rowLen = w + 1;
-  const modes = Array.from({ length: 7 }, () => new Uint8Array(h * rowLen));
-  const seen = new Uint32Array(65536);
-  let stamp = 0;
+  const out = new Uint8Array(h * rowLen);
   for (let y = 0; y < h; y++) {
+    const at = y * rowLen;
+    out[at] = mode;
     const cur = samples.subarray(y * w, (y + 1) * w);
     const prev = y === 0 ? null : samples.subarray((y - 1) * w, y * w);
-    const at = y * rowLen;
-    let bestP = 0, bestPC = Infinity;
-    let bestM = 0, bestMC = Infinity;
-    for (let t = 0; t < 5; t++) {
-      modes[t][at] = t;
-      const dst = modes[t].subarray(at + 1, at + rowLen);
-      filterRow(t, cur, prev, 1, dst);
-      const pc = pairsOf(dst, seen, ++stamp);
-      if (pc < bestPC) { bestPC = pc; bestP = t; }
-      const mc = signedSum(dst);
-      if (mc < bestMC) { bestMC = mc; bestM = t; }
-    }
-    modes[5].set(modes[bestP].subarray(at, at + rowLen), at);
-    modes[6].set(modes[bestM].subarray(at, at + rowLen), at);
+    filterRow(mode, cur, prev, 1, out.subarray(at + 1, at + rowLen));
   }
-  return modes;
+  return out;
 }
 
 const chunkBytes = (form) =>
@@ -279,20 +273,28 @@ export function screenCandidates(rgba, width, height, topK = 2) {
   for (const form of forms) {
     const chunks = chunkBytes(form);
     if (form.colourType === 3) {
-      const bank = buildPaletteRowBank(form.samples, width, height);
-      const modes = form.name === 'pal-cooccur' || form.name === 'pal-luminance' ? [0, 1, 5, 6] : [0, 1, 2, 5];
-      const names = ['0', '1', '2', '3', '4', 'pairs', 'minsum'];
-      for (const m of modes) {
-        const z = deflateSync(bank[m], SCREEN_HI);
-        consider(form, names[m], bank[m], z, z.length + chunks);
+      if (form.name === 'pal-count' || form.name === 'pal-bcooccur') {
+        const cands = generateFilterCandidatesWasm(form.samples, width, height, 1, 2, 3);
+        const names = ['band24', '0', '1'];
+        for (let m = 0; m < cands.length; m++) {
+          const z = deflateSync(cands[m], SCREEN_HI);
+          consider(form, names[m], cands[m], z, z.length + chunks);
+        }
+      } else {
+        const modes = form.name === 'pal-cooccur' ? [0, 1] : [0];
+        for (const m of modes) {
+          const buf = buildFixedRowMode(form.samples, width, height, m);
+          const z = deflateSync(buf, SCREEN_HI);
+          consider(form, String(m), buf, z, z.length + chunks);
+        }
       }
       continue;
     }
 
-    // Native WASM returns only the 4-5 elite finalists [band, lzrow, None, Paeth, (rbrute)]!
-    const includeBrute = form.bpp <= 2;
-    const cands = generateFilterCandidatesWasm(form.samples, width, height, form.bpp, includeBrute, includeBrute ? 5 : 4);
-    const names = includeBrute ? ['band24', 'lzrow', '0', '4', 'rbrute'] : ['band40', 'lzrow', '0', '4'];
+    // Native WASM returns elite finalists including exact-Huffman Viterbi DP!
+    const mode = form.bpp <= 2 ? 1 : 0;
+    const cands = generateFilterCandidatesWasm(form.samples, width, height, form.bpp, mode, 5);
+    const names = mode === 1 ? ['band16', 'viterbi', 'lzrow', '0', '4'] : ['band40', 'viterbi', 'lzrow', '0', '4'];
     const sOpt = form.bpp <= 2 ? SCREEN_HI : SCREEN_LO;
     for (let m = 0; m < cands.length; m++) {
       const z = deflateSync(cands[m], sOpt);
@@ -301,8 +303,10 @@ export function screenCandidates(rgba, width, height, topK = 2) {
   }
 
   const rankLim = Math.min(3, pool.length);
+  const topScreenBytes = pool.length > 0 ? pool[0].bytes : Infinity;
   for (let i = 0; i < rankLim; i++) {
     const c = pool[i];
+    if (i > 0 && c.bytes > topScreenBytes * 1.015) continue;
     const ch = chunkBytes(c.form);
     const zd = deflateSync(c.data, RANK_DEF);
     let bestZ = zd;
