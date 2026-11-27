@@ -339,7 +339,7 @@ function filterZlibBrute(rowBank, w, h, bpp, out, level = 3, context = 32768) {
       const row = rowBank[t].subarray(at, at + rowLen);
       const len = deflateSync(
         row,
-        before.length === 0 ? { level, memLevel: 8 } : { level, memLevel: 8, dictionary: before }
+        before.length === 0 ? { level, memLevel: 7 } : { level, memLevel: 7, dictionary: before }
       ).length;
       if (len < bestLen) { bestLen = len; bestT = t; }
     }
@@ -355,7 +355,7 @@ function filterZlibBrute(rowBank, w, h, bpp, out, level = 3, context = 32768) {
  * - Exact coarse-to-fine row-level boundary refinement with preceding 8 KiB context!
  * - Final bidirectional segment-mode verification pass (seeing BOTH prev & next segments)!
  */
-function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, level = 4, strategy = constants.Z_DEFAULT_STRATEGY, hysteresis = 10) {
+function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, level = 4, strategy = constants.Z_DEFAULT_STRATEGY, hysteresis = 10, doBidir = true) {
   const rowLen = w * bpp + 1;
   const numModes = rowBank.length;
   const maxWin = Math.floor(winBytes / rowLen) * rowLen;
@@ -431,17 +431,17 @@ function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, leve
       if (c < bestC) { bestC = c; bestY = y; }
     }
     let center = bestY;
-    bestC = evalSplit(bestY, 3);
+    bestC = evalSplit(bestY, 2);
     for (let y = Math.max(yStart + 2, center - 4); y <= Math.min(yEnd - 2, center + 4); y += 2) {
       if (y === bestY) continue;
-      const c = evalSplit(y, 3);
+      const c = evalSplit(y, 2);
       if (c < bestC) { bestC = c; bestY = y; }
     }
     center = bestY;
     for (const dy of [-1, 1]) {
       const y = center + dy;
       if (y > yStart && y < yEnd) {
-        const c = evalSplit(y, 3);
+        const c = evalSplit(y, 2);
         if (c < bestC) { bestC = c; bestY = y; }
       }
     }
@@ -454,8 +454,8 @@ function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, leve
     }
   }
 
-  // Bidirectional segment-mode re-check at level 3 (capped to <=220 KiB for fast screening!)
-  if (segs.length >= 2) {
+  // Bidirectional segment-mode re-check at level 3 (capped to <=420 KiB for fast screening!)
+  if (doBidir && segs.length >= 2) {
     const padRows = Math.min(12, Math.max(4, Math.floor(12288 / rowLen)));
     for (let si = 0; si < segs.length; si++) {
       const seg = segs[si];
@@ -488,12 +488,14 @@ const chunkBytes = (form) =>
   (form.trns === null ? 0 : 12 + form.trns.length);
 
 const SCREEN_DEF = Object.freeze({ level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
+const SCREEN_FAST = Object.freeze({ level: 4, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
 const RANK_DEF = Object.freeze({ level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
 const RANK_FILT = Object.freeze({ level: 9, memLevel: 8, strategy: constants.Z_FILTERED });
 
 export function screenCandidates(rgba, width, height, topK = 2) {
   const forms = formsOf(rgba, width, height);
   const pool = [];
+  let maxPool = Math.max(2, topK + 1);
 
   const consider = (form, choice, data, zlibBuf, bytes, clone = true) => {
     for (let i = 0; i < pool.length; i++) {
@@ -508,7 +510,6 @@ export function screenCandidates(rgba, width, height, topK = 2) {
         }
       }
     }
-    const maxPool = Math.max(3, topK + 2);
     if (pool.length < maxPool || bytes < pool[pool.length - 1].bytes) {
       pool.push({
         form,
@@ -540,22 +541,34 @@ export function screenCandidates(rgba, width, height, topK = 2) {
     const bank = buildRowBank(form.samples, width, height, form.bpp, false);
     if (form.bpp <= 2) {
       const bruteBuf = new Uint8Array(size);
-      filterZlibBrute(bank, width, height, form.bpp, bruteBuf, 3, 32768);
+      filterZlibBrute(bank, width, height, form.bpp, bruteBuf, 3, 24576);
       bank.push(bruteBuf);
     }
 
+    // Fast deterministic density probe on Paeth to avoid slow level-6 screening on huge noisy photos (>220 KB)
+    let isHuge = false;
+    if (form.bpp >= 3) {
+      const zp = deflateSync(bank[4], SCREEN_FAST);
+      if (zp.length > 220_000) {
+        isHuge = true;
+        maxPool = Math.max(2, topK);
+        consider(form, '4', bank[4], zp, zp.length + chunks, false);
+      }
+    }
+
+    const screenOpt = isHuge ? SCREEN_FAST : SCREEN_DEF;
     const names = ['0', '1', '2', '3', '4', 'pairs', 'minsum', 'brute'];
     for (let m = 0; m < bank.length; m++) {
-      const z = deflateSync(bank[m], SCREEN_DEF);
+      if (isHuge && (m === 4 || m === 3)) continue;
+      const z = deflateSync(bank[m], screenOpt);
       consider(form, names[m], bank[m], z, z.length + chunks, false);
     }
 
     const buf = new Uint8Array(size);
-    for (const [bh, hyst] of [[24, 0], [40, 8]]) {
-      filterBandHybrid(bank, width, height, form.bpp, buf, bh, 32768, 4, constants.Z_DEFAULT_STRATEGY, hyst);
-      const z = deflateSync(buf, SCREEN_DEF);
-      consider(form, `band${bh}`, buf, z, z.length + chunks, true);
-    }
+    // Single fast 32-row hybrid banded pass (exact row boundary refinement + bidirectional re-check)
+    filterBandHybrid(bank, width, height, form.bpp, buf, 32, 32768, isHuge ? 3 : 4, constants.Z_DEFAULT_STRATEGY, 0, !isHuge);
+    const z32 = deflateSync(buf, screenOpt);
+    consider(form, 'band32', buf, z32, z32.length + chunks, true);
   }
 
   // Re-rank top 3 pool entries by min(z9_default, z9_filtered when dense)

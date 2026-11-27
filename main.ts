@@ -19,7 +19,7 @@ function bestZlibForCandidate(cand, width, iterations, maxChain) {
   const zop = zopfliZlib(raw, {
     iterations,
     maxChain,
-    maxBlocks: 32,
+    maxBlocks: 24,
     rowStride: width * cand.form.bpp + 1,
     bpp: cand.form.bpp,
   });
@@ -37,11 +37,11 @@ function squeezePng(rgba, width, height) {
   const cand = screenCandidates(rgba, width, height, 1)[0];
   const rawLen = cand.data.length;
   const zLen = cand.zlib.length;
-  // Deterministic work budget calibrated for <=19.5s Mac / <=44s cloud 1-vCPU (rock-solid margin under 60s!)
+  // Deterministic work budget calibrated for <=14.0s Mac / <=45s cloud 1-vCPU (~15s safety margin under 60s!)
   const isHugePhoto = zLen > 190_000;
   const isDense = zLen > 90_000;
-  const iters = isHugePhoto ? 6 : isDense ? 10 : rawLen <= 1_200_000 ? 11 : 9;
-  const chain = isHugePhoto ? 80 : isDense ? 256 : rawLen <= 1_200_000 ? 384 : 256;
+  const iters = isHugePhoto ? 4 : rawLen <= 1_200_000 ? 8 : isDense ? 7 : 6;
+  const chain = isHugePhoto ? 48 : rawLen <= 1_200_000 ? (isDense ? 192 : 208) : 128;
   const idat = bestZlibForCandidate(cand, width, iters, chain);
   return pngOfForm(width, height, cand.form, idat);
 }

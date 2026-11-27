@@ -17,7 +17,10 @@ const DIST_EXTRA = Uint8Array.of(
   7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
 );
 const CL_ORDER = Uint8Array.of(16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);
-const LONG_LEN_STOPS = Uint16Array.of(30, 34, 42, 50, 58, 66, 82, 98, 114, 130, 162, 194, 226);
+const LONG_LEN_STOPS = Uint16Array.of(16, 18, 20, 24, 30, 34, 42, 50, 58, 66, 82, 98, 114, 130, 162, 194, 226);
+const FINAL_LEN_STOPS = Uint16Array.of(
+  40, 42, 44, 48, 50, 56, 58, 64, 66, 72, 80, 82, 96, 98, 112, 114, 128, 130, 144, 160, 162, 176, 192, 194, 208, 224, 226, 240
+);
 
 const LEN_SYM = new Uint16Array(259);
 const LEN_EX = new Uint8Array(259);
@@ -946,8 +949,8 @@ function precomputeBlockMatches(
             closeBest = l;
             record(l, dist);
             if (closeBest === maxLen) break;
-            if (closeBest >= 96 && chain > 24) chain = 24;
-            else if (closeBest >= 32 && chain > 80) chain = 80;
+            if (closeBest >= 64 && chain > 16) chain = 16;
+            else if (closeBest >= 24 && chain > 48) chain = 48;
           }
         }
         const next = prev[cand & WIN_MASK];
@@ -1065,30 +1068,33 @@ function optimalParseBlock(
       const dist = mDist[s];
       const base = c + distFullCost[DIST_SYM[dist]];
       const startL = endL > prevL ? prevL + 1 : 3;
-      if (exactAllLengths || endL <= 20) {
+      if ((exactAllLengths === 2) || endL <= (exactAllLengths === 1 ? 36 : 14)) {
         for (let l = startL; l <= endL; l++) {
           const mc = base + lenFullCost[l];
           const ni = rel + l;
           if (mc < dpCost[ni]) { dpCost[ni] = mc; dpLen[ni] = l; dpDist[ni] = dist; }
         }
       } else {
-        const denseEnd = 20 < endL ? 20 : endL;
+        const denseLim = exactAllLengths === 1 ? 36 : 14;
+        const stops = exactAllLengths === 1 ? FINAL_LEN_STOPS : LONG_LEN_STOPS;
+        const tailPad = exactAllLengths === 1 ? 4 : 2;
+        const denseEnd = denseLim < endL ? denseLim : endL;
         for (let l = startL; l <= denseEnd; l++) {
           const mc = base + lenFullCost[l];
           const ni = rel + l;
           if (mc < dpCost[ni]) { dpCost[ni] = mc; dpLen[ni] = l; dpDist[ni] = dist; }
         }
-        const loStop = startL > 21 ? startL : 21;
-        const hiStop = endL - 3;
-        for (let k = 0; k < LONG_LEN_STOPS.length; k++) {
-          const l = LONG_LEN_STOPS[k];
+        const loStop = startL > denseLim + 1 ? startL : denseLim + 1;
+        const hiStop = endL - tailPad - 1;
+        for (let k = 0; k < stops.length; k++) {
+          const l = stops[k];
           if (l < loStop) continue;
           if (l > hiStop) break;
           const mc = base + lenFullCost[l];
           const ni = rel + l;
           if (mc < dpCost[ni]) { dpCost[ni] = mc; dpLen[ni] = l; dpDist[ni] = dist; }
         }
-        const tailStart = endL - 2 > startL ? endL - 2 : startL;
+        const tailStart = endL - tailPad > startL ? endL - tailPad : startL;
         for (let l = tailStart; l <= endL; l++) {
           const mc = base + lenFullCost[l];
           const ni = rel + l;
@@ -1208,11 +1214,12 @@ function zopfliOptimizeRange(
 
   let lastImproved = false;
   for (let iter = 0; iter < iterations; iter++) {
-    const isExactLengths = iter === iterations - 1;
+    // 0 = fast warm-up (<=20 + stops), 1 = rich final (<=36 + dense stops + tail-4), 2 = full 3..258 (1-bpp only)
+    const exactMode = iter === iterations - 1 ? (data.length <= 1_200_000 ? 2 : 1) : 0;
     const isExactHeader = iter >= iterations - 2;
     const { litLens, dists, posArr, tokCnt } = optimalParseBlock(
       data, runLeft, runBpp, bpp, bStart, bEnd,
-      matches, llCost, dCost, dpCost, dpLen, dpDist, subStart, subEnd, isExactLengths
+      matches, llCost, dCost, dpCost, dpLen, dpDist, subStart, subEnd, exactMode
     );
     const { llFreq, dFreq, extraTotal } = statsFromRange(litLens, dists, 0, tokCnt);
     const dyn = buildBestDynamicTree(llFreq, dFreq, extraTotal, !isExactHeader);
@@ -1260,13 +1267,13 @@ function zopfliOptimizeRange(
     }
   }
 
-  // Bonus exact-Huffman continuation pass only when 1-bpp (fast!) or substantial bit gain (> 256 bits)
-  if (lastImproved && bestDyn !== null && iterations >= 6 && (data.length <= 1_200_000 || lastBits - bestBits > 256)) {
+  // Bonus exact-Huffman continuation pass only on fast 1-bpp images!
+  if (lastImproved && bestDyn !== null && iterations >= 6 && data.length <= 1_200_000) {
     for (let i = 0; i < 286; i++) llCost[i] = bestDyn.llLens[i] > 0 ? bestDyn.llLens[i] : 16;
     for (let i = 0; i < 30; i++) dCost[i] = bestDyn.dLens[i] > 0 ? bestDyn.dLens[i] : 16;
     const { litLens, dists, posArr, tokCnt } = optimalParseBlock(
       data, runLeft, runBpp, bpp, bStart, bEnd,
-      matches, llCost, dCost, dpCost, dpLen, dpDist, subStart, subEnd, true
+      matches, llCost, dCost, dpCost, dpLen, dpDist, subStart, subEnd, 2
     );
     const { llFreq, dFreq, extraTotal } = statsFromRange(litLens, dists, 0, tokCnt);
     const dyn = buildBestDynamicTree(llFreq, dFreq, extraTotal, false);
@@ -1321,7 +1328,7 @@ export function zopfliZlib(data, { iterations = 13, maxChain = 448, maxBlocks = 
     );
 
     if (res.tokCnt >= 768) {
-      const subSplits = splitTokenStream(res.litLens, res.dists, res.tokCnt, 6, 256);
+      const subSplits = splitTokenStream(res.litLens, res.dists, res.tokCnt, 4, 256);
       if (subSplits.length > 2) {
         for (let s = 0; s < subSplits.length - 1; s++) {
           const ts = subSplits[s];
@@ -1329,12 +1336,12 @@ export function zopfliZlib(data, { iterations = 13, maxChain = 448, maxBlocks = 
           const rawStart = res.posArr[ts];
           const rawEnd = te < res.tokCnt ? res.posArr[te] : bEnd;
           const initSub = { litLens: res.litLens.subarray(ts, te), dists: res.dists.subarray(ts, te) };
-          if (iterations <= 7) {
+          if (data.length > 1_200_000 || iterations <= 7) {
             finalBlocks.push({ litLens: initSub.litLens, dists: initSub.dists, rawStart, rawEnd });
           } else {
             const reopt = zopfliOptimizeRange(
               data, runLeft, runBpp, bpp, bStart, bEnd,
-              matches, 2, dpCost, dpLen, dpDist, rawStart - bStart, rawEnd - bStart, initSub
+              matches, 1, dpCost, dpLen, dpDist, rawStart - bStart, rawEnd - bStart, initSub
             );
             finalBlocks.push({ litLens: reopt.litLens, dists: reopt.dists, rawStart, rawEnd });
           }
