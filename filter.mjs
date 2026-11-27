@@ -1,5 +1,6 @@
 import { constants, deflateSync } from 'node:zlib';
 import { filterRow } from './png.mjs';
+import { fastLzLiteralCounts } from './zopfli.mjs';
 
 function wordsOf(rgba) {
   const at = rgba.byteOffset % 4 === 0 ? rgba : rgba.slice();
@@ -162,21 +163,7 @@ function cooccurrenceOrder(rgba, width, height, colours) {
   return out;
 }
 
-function paletteOrder(rgba, width, height, colours, order) {
-  if (order === 'cooccur') return cooccurrenceOrder(rgba, width, height, colours);
-  const lum = (c) => 299 * c.rgba[0] + 587 * c.rgba[1] + 114 * c.rgba[2];
-  return [...colours].sort((x, y) => {
-    const ta = x.rgba[3] === 255 ? 1 : 0;
-    const tb = y.rgba[3] === 255 ? 1 : 0;
-    if (ta !== tb) return ta - tb;
-    if (ta === 0 && x.rgba[3] !== y.rgba[3]) return x.rgba[3] - y.rgba[3];
-    if (order === 'luminance') return lum(x) - lum(y) || x.word - y.word;
-    return y.count - x.count || x.word - y.word;
-  });
-}
-
-function paletteForm(rgba, width, height, colours, order) {
-  const entries = paletteOrder(rgba, width, height, colours, order);
+function buildPaletteFromEntries(rgba, entries) {
   const index = new Map(entries.map((c, i) => [c.word, i]));
   const plte = new Uint8Array(entries.length * 3);
   let transparent = 0;
@@ -190,16 +177,80 @@ function paletteForm(rgba, width, height, colours, order) {
   const u32 = wordsOf(rgba);
   const indices = new Uint8Array(n);
   for (let i = 0; i < n; i++) indices[i] = index.get(u32[i]);
-  return { plte, trns, indices };
+  return { plte, trns, indices, entries };
+}
+
+function paletteForm(rgba, width, height, colours, order) {
+  let entries;
+  if (order === 'cooccur') entries = cooccurrenceOrder(rgba, width, height, colours);
+  else {
+    const lum = (c) => 299 * c.rgba[0] + 587 * c.rgba[1] + 114 * c.rgba[2];
+    entries = [...colours].sort((x, y) => {
+      const ta = x.rgba[3] === 255 ? 1 : 0;
+      const tb = y.rgba[3] === 255 ? 1 : 0;
+      if (ta !== tb) return ta - tb;
+      if (ta === 0 && x.rgba[3] !== y.rgba[3]) return x.rgba[3] - y.rgba[3];
+      if (order === 'luminance') return lum(x) - lum(y) || x.word - y.word;
+      return y.count - x.count || x.word - y.word;
+    });
+  }
+  return buildPaletteFromEntries(rgba, entries);
+}
+
+/**
+ * Re-order opaque palette entries by actual LZ77 literal frequency descending!
+ * Aligns monotonic Huffman code lengths across 0..K-1, shrinking Dynamic Huffman headers on every block.
+ */
+function paletteLzFreqForm(rgba, width, height, baseForm) {
+  const rowLen = width + 1;
+  const raw0 = new Uint8Array(height * rowLen);
+  const edgeCnt = new Int32Array(256);
+  for (let y = 0; y < height; y++) {
+    const row = baseForm.samples.subarray(y * width, (y + 1) * width);
+    raw0.set(row, y * rowLen + 1);
+    edgeCnt[row[0]]++;
+    edgeCnt[row[width - 1]]++;
+  }
+  const litFreq = fastLzLiteralCounts(raw0, rowLen);
+  const entries = baseForm.entries;
+  const k = entries.length;
+  let numTrans = 0;
+  while (numTrans < k && entries[numTrans].rgba[3] !== 255) numTrans++;
+  const opaqueIdx = [];
+  for (let i = numTrans; i < k; i++) opaqueIdx.push(i);
+
+  // If no transparent entries, lock index 0 to the dominant border color so filter-byte 0 merges with scanline edge runs!
+  let borderIdx = -1;
+  if (numTrans === 0 && opaqueIdx.length > 1) {
+    let bestE = -1;
+    for (const i of opaqueIdx) {
+      if (edgeCnt[i] > bestE) { bestE = edgeCnt[i]; borderIdx = i; }
+    }
+  }
+  opaqueIdx.sort((a, b) => {
+    if (a === borderIdx) return -1;
+    if (b === borderIdx) return 1;
+    return litFreq[b] - litFreq[a] || entries[b].count - entries[a].count || entries[a].word - entries[b].word;
+  });
+
+  const reordered = new Array(k);
+  for (let i = 0; i < numTrans; i++) reordered[i] = entries[i];
+  for (let i = 0; i < opaqueIdx.length; i++) reordered[numTrans + i] = entries[opaqueIdx[i]];
+  const p = buildPaletteFromEntries(rgba, reordered);
+  return { name: 'pal-lzfreq', colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, entries: p.entries };
 }
 
 export function formsOf(rgba, width, height) {
   const { opaque, grey, colours } = analyse(rgba);
   const forms = [];
   if (colours !== null) {
-    for (const order of ['count', 'luminance', 'cooccur']) {
+    const pCount = paletteForm(rgba, width, height, colours, 'count');
+    const fCount = { name: 'pal-count', colourType: 3, bpp: 1, samples: pCount.indices, plte: pCount.plte, trns: pCount.trns, entries: pCount.entries };
+    forms.push(fCount);
+    forms.push(paletteLzFreqForm(rgba, width, height, fCount));
+    for (const order of ['luminance', 'cooccur']) {
       const p = paletteForm(rgba, width, height, colours, order);
-      forms.push({ name: `pal-${order}`, colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns });
+      forms.push({ name: `pal-${order}`, colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, entries: p.entries });
     }
     if (!grey) return forms;
   }
@@ -233,11 +284,22 @@ function pairsOf(row, seen, stamp) {
   return n;
 }
 
-function buildRowBank(samples, w, h, bpp) {
+function rowEntropy(row, counts) {
+  counts.fill(0);
+  const n = row.length;
+  for (let i = 0; i < n; i++) counts[row[i]]++;
+  let e = 0;
+  for (let i = 0; i < 256; i++) { const c = counts[i]; if (c > 0) e -= c * Math.log2(c / n); }
+  return e;
+}
+
+function buildRowBank(samples, w, h, bpp, includeEntropy = true) {
   const stride = w * bpp;
   const rowLen = stride + 1;
-  const modes = Array.from({ length: 7 }, () => new Uint8Array(h * rowLen));
+  const numModes = includeEntropy ? 8 : 7;
+  const modes = Array.from({ length: numModes }, () => new Uint8Array(h * rowLen));
   const seen = new Uint32Array(65536);
+  const counts = includeEntropy ? new Int32Array(256) : null;
   let stamp = 0;
   for (let y = 0; y < h; y++) {
     const cur = samples.subarray(y * stride, (y + 1) * stride);
@@ -245,6 +307,7 @@ function buildRowBank(samples, w, h, bpp) {
     const at = y * rowLen;
     let bestP = 0, bestPC = Infinity;
     let bestM = 0, bestMC = Infinity;
+    let bestE = 0, bestEC = Infinity;
     for (let t = 0; t < 5; t++) {
       modes[t][at] = t;
       const dst = modes[t].subarray(at + 1, at + rowLen);
@@ -253,20 +316,47 @@ function buildRowBank(samples, w, h, bpp) {
       if (pc < bestPC) { bestPC = pc; bestP = t; }
       const mc = signedSum(dst);
       if (mc < bestMC) { bestMC = mc; bestM = t; }
+      if (includeEntropy) {
+        const ec = rowEntropy(dst, counts);
+        if (ec < bestEC) { bestEC = ec; bestE = t; }
+      }
     }
     modes[5].set(modes[bestP].subarray(at, at + rowLen), at);
     modes[6].set(modes[bestM].subarray(at, at + rowLen), at);
+    if (includeEntropy) modes[7].set(modes[bestE].subarray(at, at + rowLen), at);
   }
   return modes;
 }
 
-/**
- * Fast hybrid banded filter selector with bounded local-window boundary refinement!
- * Uses level 4 for band choices (~120 ms) and a compact local window (+/- 24 rows, coarse-to-fine ~25 ms)
- * for exact row-level transition alignment!
- */
-function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, level = 4) {
+function filterZlibBrute(rowBank, w, h, bpp, out, level = 3, context = 32768) {
   const rowLen = w * bpp + 1;
+  for (let y = 0; y < h; y++) {
+    const at = y * rowLen;
+    const before = out.subarray(Math.max(0, at - context), at);
+    let bestT = 0, bestLen = Infinity;
+    for (let t = 0; t < 5; t++) {
+      const row = rowBank[t].subarray(at, at + rowLen);
+      const len = deflateSync(
+        row,
+        before.length === 0 ? { level, memLevel: 8 } : { level, memLevel: 8, dictionary: before }
+      ).length;
+      if (len < bestLen) { bestLen = len; bestT = t; }
+    }
+    out.set(rowBank[bestT].subarray(at, at + rowLen), at);
+  }
+  return out;
+}
+
+/**
+ * Hybrid banded filter selector with:
+ * - Modes: fixed 0..4, per-row pairs, minsum, entropy, AND per-row brute!
+ * - Joint-window zlib selection (preserving shared Huffman trees & LZ77 context)
+ * - Exact coarse-to-fine row-level boundary refinement with preceding 8 KiB context!
+ * - Final bidirectional segment-mode verification pass (seeing BOTH prev & next segments)!
+ */
+function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, level = 4, strategy = constants.Z_DEFAULT_STRATEGY, hysteresis = 10) {
+  const rowLen = w * bpp + 1;
+  const numModes = rowBank.length;
   const maxWin = Math.floor(winBytes / rowLen) * rowLen;
   const work = new Uint8Array(maxWin + bandH * rowLen);
   const numBands = Math.ceil(h / bandH);
@@ -280,44 +370,55 @@ function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, leve
     const wLen = Math.min(at, maxWin);
     if (wLen > 0) work.set(out.subarray(at - wLen, at), 0);
     const slice = work.subarray(0, wLen + bBytes);
+    const prevMode = bi > 0 ? bandModes[bi - 1] : -1;
 
-    let bestLen = Infinity;
+    let bestScore = Infinity;
     let bestMode = 0;
-    for (let mode = 0; mode < 7; mode++) {
+    for (let mode = 0; mode < numModes; mode++) {
       work.set(rowBank[mode].subarray(at, at + bBytes), wLen);
-      const len = deflateSync(slice, { level, memLevel: 8 }).length;
-      if (len < bestLen) { bestLen = len; bestMode = mode; }
+      const len = deflateSync(slice, { level, memLevel: 8, strategy }).length;
+      // Small hysteresis bonus to keep previous mode unless switching saves meaningfully
+      const score = mode === prevMode ? len - hysteresis : len;
+      if (score < bestScore) { bestScore = score; bestMode = mode; }
     }
     bandModes[bi] = bestMode;
     out.set(rowBank[bestMode].subarray(at, at + bBytes), at);
   }
 
-  // Fast local boundary refinement with preceding 8 KiB context window
+  // Merge adjacent bands with identical modes into segments [y0, y1, mode]
+  const segs = [];
+  for (let bi = 0; bi < numBands; bi++) {
+    const y0 = bi * bandH;
+    const y1 = Math.min(h, (bi + 1) * bandH);
+    const m = bandModes[bi];
+    if (segs.length > 0 && segs[segs.length - 1].mode === m) segs[segs.length - 1].y1 = y1;
+    else segs.push({ y0, y1, mode: m });
+  }
+
+  // Exact local boundary refinement between every pair of adjacent segments!
   const halfSpan = Math.min(bandH, 40);
   const ctxMax = Math.floor(8192 / rowLen) * rowLen;
   const spanWork = new Uint8Array(ctxMax + (halfSpan * 2 + 2) * rowLen);
-  for (let bi = 0; bi < numBands - 1; bi++) {
-    const mA = bandModes[bi];
-    const mB = bandModes[bi + 1];
-    if (mA === mB) continue;
 
-    const yMid = (bi + 1) * bandH;
-    const yStart = Math.max(bi * bandH, yMid - halfSpan);
-    const yEnd = Math.min(h, Math.min((bi + 2) * bandH, yMid + halfSpan));
+  for (let si = 0; si < segs.length - 1; si++) {
+    const sA = segs[si], sB = segs[si + 1];
+    const yMid = sA.y1;
+    const yStart = Math.max(sA.y0, yMid - halfSpan);
+    const yEnd = Math.min(sB.y1, yMid + halfSpan);
     const spanH = yEnd - yStart;
     if (spanH < 6) continue;
     const atStart = yStart * rowLen;
     const ctxLen = Math.min(atStart, ctxMax);
     if (ctxLen > 0) spanWork.set(out.subarray(atStart - ctxLen, atStart), 0);
     const spanSlice = spanWork.subarray(0, ctxLen + spanH * rowLen);
-    const bankA = rowBank[mA];
-    const bankB = rowBank[mB];
+    const bankA = rowBank[sA.mode];
+    const bankB = rowBank[sB.mode];
 
     const evalSplit = (splitY, lv = 2) => {
       const k = splitY - yStart;
       if (k > 0) spanWork.set(bankA.subarray(atStart, atStart + k * rowLen), ctxLen);
       if (k < spanH) spanWork.set(bankB.subarray(atStart + k * rowLen, yEnd * rowLen), ctxLen + k * rowLen);
-      return deflateSync(spanSlice, { level: lv, memLevel: 8 }).length;
+      return deflateSync(spanSlice, { level: lv, memLevel: 8, strategy }).length;
     };
 
     let bestY = yMid;
@@ -346,26 +447,36 @@ function filterBandHybrid(rowBank, w, h, bpp, out, bandH, winBytes = 32768, leve
       const k = bestY - yStart;
       if (k > 0) out.set(bankA.subarray(atStart, atStart + k * rowLen), atStart);
       if (k < spanH) out.set(bankB.subarray(atStart + k * rowLen, yEnd * rowLen), atStart + k * rowLen);
+      sA.y1 = bestY;
+      sB.y0 = bestY;
     }
   }
-  return out;
-}
 
-function filterZlibBrute(rowBank, w, h, bpp, out, level = 3, context = 32768) {
-  const rowLen = w * bpp + 1;
-  for (let y = 0; y < h; y++) {
-    const at = y * rowLen;
-    const before = out.subarray(Math.max(0, at - context), at);
-    let bestT = 0, bestLen = Infinity;
-    for (let t = 0; t < 5; t++) {
-      const row = rowBank[t].subarray(at, at + rowLen);
-      const len = deflateSync(
-        row,
-        before.length === 0 ? { level, memLevel: 8 } : { level, memLevel: 8, dictionary: before }
-      ).length;
-      if (len < bestLen) { bestLen = len; bestT = t; }
+  // Bidirectional segment-mode re-check at level 3 (capped to <=220 KiB for fast screening!)
+  if (segs.length >= 2) {
+    const padRows = Math.min(12, Math.max(4, Math.floor(12288 / rowLen)));
+    for (let si = 0; si < segs.length; si++) {
+      const seg = segs[si];
+      if (seg.y1 <= seg.y0) continue;
+      const wStart = Math.max(0, seg.y0 - padRows);
+      const wEnd = Math.min(h, seg.y1 + padRows);
+      const wBytes = (wEnd - wStart) * rowLen;
+      if (wBytes > 420 * 1024) continue;
+      const buf = out.subarray(wStart * rowLen, wEnd * rowLen).slice();
+      const segOff = (seg.y0 - wStart) * rowLen;
+      let bestM = seg.mode;
+      let bestC = deflateSync(buf, { level: 3, memLevel: 8, strategy }).length;
+      for (let m = 0; m < numModes; m++) {
+        if (m === seg.mode) continue;
+        buf.set(rowBank[m].subarray(seg.y0 * rowLen, seg.y1 * rowLen), segOff);
+        const c = deflateSync(buf, { level: 3, memLevel: 8, strategy }).length;
+        if (c + 4 < bestC) { bestC = c; bestM = m; }
+      }
+      if (bestM !== seg.mode) {
+        seg.mode = bestM;
+        out.set(rowBank[bestM].subarray(seg.y0 * rowLen, seg.y1 * rowLen), seg.y0 * rowLen);
+      }
     }
-    out.set(rowBank[bestT].subarray(at, at + rowLen), at);
   }
   return out;
 }
@@ -374,10 +485,11 @@ const chunkBytes = (form) =>
   (form.plte === null ? 0 : 12 + form.plte.length) +
   (form.trns === null ? 0 : 12 + form.trns.length);
 
-const SCREEN_ZLIB = Object.freeze({ level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
-const RANK_ZLIB = Object.freeze({ level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
+const SCREEN_DEF = Object.freeze({ level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
+const RANK_DEF = Object.freeze({ level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
+const RANK_FILT = Object.freeze({ level: 9, memLevel: 8, strategy: constants.Z_FILTERED });
 
-export function screenCandidates(rgba, width, height, topK = 1) {
+export function screenCandidates(rgba, width, height, topK = 2) {
   const forms = formsOf(rgba, width, height);
   const pool = [];
 
@@ -394,7 +506,7 @@ export function screenCandidates(rgba, width, height, topK = 1) {
         }
       }
     }
-    const maxPool = Math.max(4, topK + 2);
+    const maxPool = Math.max(6, topK + 4);
     if (pool.length < maxPool || bytes < pool[pool.length - 1].bytes) {
       pool.push({
         form,
@@ -413,43 +525,48 @@ export function screenCandidates(rgba, width, height, topK = 1) {
     const chunks = chunkBytes(form);
 
     if (form.colourType === 3) {
-      const bank = buildRowBank(form.samples, width, height, 1);
-      const modes = form.name === 'pal-count' ? [0, 1, 2, 5, 6] : [0, 1, 5, 6];
+      const bank = buildRowBank(form.samples, width, height, 1, false);
+      const modes = form.name === 'pal-count' || form.name === 'pal-lzfreq' ? [0, 1, 2, 5, 6] : [0, 1, 2, 4, 5, 6];
       const names = ['0', '1', '2', '3', '4', 'pairs', 'minsum'];
       for (const m of modes) {
-        const z = deflateSync(bank[m], SCREEN_ZLIB);
+        const z = deflateSync(bank[m], SCREEN_DEF);
         consider(form, names[m], bank[m], z, z.length + chunks, false);
       }
       continue;
     }
 
-    const bank = buildRowBank(form.samples, width, height, form.bpp);
-    const names = ['0', '1', '2', '3', '4', 'pairs', 'minsum'];
-    for (let m = 0; m < 7; m++) {
-      const z = deflateSync(bank[m], SCREEN_ZLIB);
+    const bank = buildRowBank(form.samples, width, height, form.bpp, true);
+    if (form.bpp <= 2) {
+      const bruteBuf = new Uint8Array(size);
+      filterZlibBrute(bank, width, height, form.bpp, bruteBuf, 4, 32768);
+      bank.push(bruteBuf);
+    }
+
+    const names = ['0', '1', '2', '3', '4', 'pairs', 'minsum', 'entropy', 'brute'];
+    for (let m = 0; m < bank.length; m++) {
+      const z = deflateSync(bank[m], SCREEN_DEF);
       consider(form, names[m], bank[m], z, z.length + chunks, false);
     }
+
     const buf = new Uint8Array(size);
-    for (const bh of [40, 72]) {
-      filterBandHybrid(bank, width, height, form.bpp, buf, bh, 32768, 4);
-      const z = deflateSync(buf, SCREEN_ZLIB);
+    for (const [bh, hyst] of [[24, 0], [40, 8], [72, 8]]) {
+      filterBandHybrid(bank, width, height, form.bpp, buf, bh, 32768, 4, constants.Z_DEFAULT_STRATEGY, hyst);
+      const z = deflateSync(buf, SCREEN_DEF);
       consider(form, `band${bh}`, buf, z, z.length + chunks, true);
-    }
-    // Per-row brute shines on 1-bpp/2-bpp images where 32 KiB spans 12-25 rows!
-    if (form.bpp <= 2) {
-      filterZlibBrute(bank, width, height, form.bpp, buf, 3, 32768);
-      const zb = deflateSync(buf, SCREEN_ZLIB);
-      consider(form, 'brute', buf, zb, zb.length + chunks, true);
     }
   }
 
+  // Re-rank top pool by min(z9_default, z9_filtered) — accurately predicts literal-aware Zopfli winners!
   for (let i = 0; i < pool.length; i++) {
     const c = pool[i];
-    const z9 = deflateSync(c.data, RANK_ZLIB);
-    const z9Bytes = z9.length + chunkBytes(c.form);
-    if (z9Bytes < c.bytes) {
-      c.zlib = new Uint8Array(z9.buffer, z9.byteOffset, z9.length);
-      c.bytes = z9Bytes;
+    const ch = chunkBytes(c.form);
+    const zd = deflateSync(c.data, RANK_DEF);
+    const zf = deflateSync(c.data, RANK_FILT);
+    const bestZ = zf.length < zd.length ? zf : zd;
+    const bestB = bestZ.length + ch;
+    if (bestB < c.bytes) {
+      c.zlib = new Uint8Array(bestZ.buffer, bestZ.byteOffset, bestZ.length);
+      c.bytes = bestB;
     }
   }
   pool.sort((a, b) => a.bytes - b.bytes);

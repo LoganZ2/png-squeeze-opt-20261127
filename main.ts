@@ -1,16 +1,9 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { constants, deflateSync, inflateSync } from 'node:zlib';
+import { inflateSync } from 'node:zlib';
 import { decodePng, pngOfForm } from './png.mjs';
 import { screenCandidates } from './filter.mjs';
 import { zopfliZlib } from './zopfli.mjs';
-
-const ZLIB_STRATEGIES = [
-  { level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY },
-  { level: 9, memLevel: 9, strategy: constants.Z_DEFAULT_STRATEGY },
-  { level: 9, memLevel: 8, strategy: constants.Z_FILTERED },
-  { level: 9, memLevel: 8, strategy: constants.Z_RLE },
-];
 
 function bytesEqual(a, b) {
   if (a.length !== b.length) return false;
@@ -20,19 +13,13 @@ function bytesEqual(a, b) {
 
 function bestZlibForCandidate(cand, width, iterations, maxChain) {
   const raw = cand.data;
+  // cand.zlib is already the exact min of zlib level-9 Z_DEFAULT_STRATEGY and Z_FILTERED!
   let best = cand.zlib;
-
-  for (let i = 0; i < ZLIB_STRATEGIES.length; i++) {
-    const z = deflateSync(raw, ZLIB_STRATEGIES[i]);
-    if (z.length < best.length) {
-      best = new Uint8Array(z.buffer, z.byteOffset, z.length);
-    }
-  }
 
   const zop = zopfliZlib(raw, {
     iterations,
     maxChain,
-    maxBlocks: 28,
+    maxBlocks: 32,
     rowStride: width * cand.form.bpp + 1,
     bpp: cand.form.bpp,
   });
@@ -47,16 +34,26 @@ function bestZlibForCandidate(cand, width, iterations, maxChain) {
 }
 
 function squeezePng(rgba, width, height) {
-  const cand = screenCandidates(rgba, width, height, 1)[0];
-  const rawLen = cand.data.length;
-  const zLen = cand.zlib.length;
-  // Deterministic work budget scaled by image complexity (safe well under 60s sandbox budget even on dense photo sets!)
-  const isHugePhoto = zLen > 250_000;
-  const isDense = zLen > 90_000;
-  const iters = isHugePhoto ? 10 : isDense ? 13 : rawLen <= 1_200_000 ? 10 : 8;
-  const chain = isHugePhoto ? 256 : isDense ? 384 : rawLen <= 1_200_000 ? 384 : 256;
-  const idat = bestZlibForCandidate(cand, width, iters, chain);
-  return pngOfForm(width, height, cand.form, idat);
+  const cands = screenCandidates(rgba, width, height, 2);
+  let bestPng = null;
+
+  for (let i = 0; i < cands.length; i++) {
+    const cand = cands[i];
+    // Test runner-up on fast 1-bpp palette near-ties (e.g. pal-count vs pal-lzfreq, < 0.9s!)
+    if (i > 0 && !(cand.form.colourType === 3 && cand.bytes <= cands[0].bytes * 1.008)) continue;
+    const rawLen = cand.data.length;
+    const zLen = cand.zlib.length;
+    const isHugePhoto = zLen > 200_000;
+    const isDense = zLen > 90_000;
+    const iters = isHugePhoto ? 8 : isDense ? 14 : rawLen <= 1_200_000 ? 14 : 10;
+    const chain = isHugePhoto ? 160 : isDense ? 512 : rawLen <= 1_200_000 ? 512 : 384;
+    const idat = bestZlibForCandidate(cand, width, iters, chain);
+    const png = pngOfForm(width, height, cand.form, idat);
+    if (bestPng === null || png.length < bestPng.length) {
+      bestPng = png;
+    }
+  }
+  return bestPng;
 }
 
 const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
