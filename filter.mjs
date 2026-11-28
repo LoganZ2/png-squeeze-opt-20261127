@@ -318,32 +318,10 @@ export function screenCandidates(rgba, width, height, topK = 3) {
   }
 
   // Hybrid Zopfli-aligned WASM tie-breaker:
-  // - On palette images (colourType === 3): fast Zopfli-aligned scout on close top-3 palette orderings!
-  // - On standard images (estBytes <= 135 KB): ultra-fast lazy+DP-split WASM screen on close non-fixed finalists!
+  // - On standard non-palette images (estBytes <= 135 KB): ultra-fast lazy+DP-split WASM screen on close non-fixed finalists!
   // - On dense multi-regime 3/4-bpp images (135 KB < estBytes <= 240 KB): lazily generate clean separate-block
   //   band20c and scout #1 vs band20c via native WASM hash3+DP scout so true Zopfli winners always win!
   if (
-    pool.length > 1 &&
-    pool[0].form.colourType === 3 &&
-    pool[1].bytes <= pool[0].bytes * 1.02
-  ) {
-    const topScreenBytes = pool[0].bytes;
-    let scoredCount = 0;
-    for (let i = 0; i < pool.length && scoredCount < 2; i++) {
-      const c = pool[i];
-      if (i > 0 && c.bytes > topScreenBytes * 1.015) break;
-      const z = scoutZopfliSizeWasm(c.data, width + 1, 1);
-      c.zopScreen = z + chunkBytes(c.form);
-      scoredCount++;
-    }
-    const scored = pool.filter((c) => c.zopScreen !== undefined);
-    const unscored = pool.filter((c) => c.zopScreen === undefined);
-    if (scored.length > 1) {
-      scored.sort((a, b) => a.zopScreen - b.zopScreen);
-      pool.length = 0;
-      pool.push(...scored, ...unscored);
-    }
-  } else if (
     pool.length > 1 &&
     pool[0].form.colourType !== 3 &&
     pool[1].bytes <= pool[0].bytes * 1.035
@@ -392,12 +370,11 @@ export function screenCandidates(rgba, width, height, topK = 3) {
     }
   }
 
-  // Monotonic native WASM multi-scale filter polish on #1 non-palette finalist (verified by scoutZopfliSizeWasm!)
+  // Monotonic native WASM multi-scale filter polish when fixed-only Viterbi wins #1 (upgrades photo bands to adaptive modes!)
   if (
     pool.length > 0 &&
-    pool[0].form.colourType !== 3 &&
-    pool[0].estBytes <= 135_000 &&
-    !(pool[0].form.bpp === 1 && pool[0].estBytes > 75_000)
+    pool[0].choice === 'viterbi' &&
+    pool[0].estBytes <= 135_000
   ) {
     const top = pool[0];
     const rowStride = width * top.form.bpp + 1;

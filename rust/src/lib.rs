@@ -1778,11 +1778,11 @@ fn split_token_stream_dp(
         }
     }
 
-    // Multi-bias header sweep, exact Huffman merge cleanup, keep strictly global best!
-    let biases: &[f64] = if fast_eval {
-        &[120.0]
-    } else {
+    // Well-calibrated header-bias DP sweep (2 biases on small/medium streams, 1 on dense), exact Huffman merge cleanup!
+    let biases: &[f64] = if !fast_eval && count <= 35_000 {
         &[60.0, 160.0]
+    } else {
+        &[120.0]
     };
     for &bias in biases {
         let mut dp = vec![f64::INFINITY; m + 1];
@@ -2788,7 +2788,7 @@ fn zopfli_optimize_range(
         } else {
             0
         };
-        if allow_full_exact && iter + 2 >= iterations && !best_out.dists.is_empty() {
+        if allow_full_exact && iter + 1 == iterations && !best_out.dists.is_empty() {
             hot_dists = build_hot_dists(&best_out.dists, &d_cost);
         } else {
             hot_dists.clear();
@@ -2896,31 +2896,6 @@ fn zopfli_optimize_range(
         }
         entropy_costs_from_stats(&ll_smooth, &d_smooth, &mut ll_cost, &mut d_cost);
         iter += 1;
-    }
-
-    // Exact integer-Huffman fixed-point polish on small blocks when iterations >= 8
-    if allow_full_exact && iterations >= 8 && (sub_end - sub_start) <= 90_000 {
-        if let Some(ref bd) = best_dyn {
-            for i in 0..286 {
-                ll_cost[i] = if bd.ll_lens[i] > 0 { bd.ll_lens[i] as f32 } else { 16.0 };
-            }
-            for i in 0..30 {
-                d_cost[i] = if bd.d_lens[i] > 0 { bd.d_lens[i] as f32 } else { 16.0 };
-            }
-            let hd = build_hot_dists(&best_out.dists, &d_cost);
-            let parsed = optimal_parse_block(
-                tbl, data, runs, bpp, row_stride, b_start, pool, &ll_cost, &d_cost, &hd,
-                dp_cost, dp_len, dp_dist, sub_start, sub_end, final_mode,
-            );
-            let (ll_f, d_f, extra) =
-                stats_from_range(tbl, &parsed.lit_lens, &parsed.dists, 0, parsed.lit_lens.len());
-            let dyn_t = build_best_dynamic_tree(&ll_f, &d_f, extra, false);
-            let fix_b = fixed_block_bits(tbl, &ll_f, &d_f, extra);
-            let bits = dyn_t.total_bits.min(fix_b);
-            if bits < best_bits {
-                best_out = parsed;
-            }
-        }
     }
 
     best_out
@@ -5586,8 +5561,8 @@ pub extern "C" fn polish_filter_candidate(
         }
     }
 
-    // Full-accuracy (10-probe) multi-scale window coordinate descent (24 -> 12 -> 6 rows)
-    let scales: &[(usize, usize)] = &[(24, 8), (12, 6), (6, 5)];
+    // Full-accuracy (10-probe) multi-scale window coordinate descent (24 -> 12 rows)
+    let scales: &[(usize, usize)] = &[(24, 8), (12, 6)];
     for &(step, n_modes) in scales {
         let modes_lim = n_modes.min(bank.len());
         for y0 in (0..hu).step_by(step) {
