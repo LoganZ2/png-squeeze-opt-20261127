@@ -1782,7 +1782,7 @@ fn split_token_stream_dp(
     let biases: &[f64] = if fast_eval {
         &[120.0]
     } else {
-        &[40.0, 120.0, 220.0]
+        &[60.0, 160.0]
     };
     for &bias in biases {
         let mut dp = vec![f64::INFINITY; m + 1];
@@ -2339,41 +2339,27 @@ fn optimal_parse_block(
             if bl >= 3 {
                 let base_b = c + bpp_dcost;
                 if bpp_nonmono {
-                    if exact_mode == 2 || bl <= dense_lim {
-                        for l in 3..=bl {
-                            let ni = rel + l;
-                            unsafe {
-                                let mc = base_b + *len_full.get_unchecked(l);
-                                if mc < *dp_cost.get_unchecked(ni) {
-                                    *dp_cost.get_unchecked_mut(ni) = mc;
-                                    *dp_len.get_unchecked_mut(ni) = l as u16;
-                                    *dp_dist.get_unchecked_mut(ni) = bpp as u16;
-                                }
+                    let de = if exact_mode == 2 { bl.min(24) } else { dense_lim.min(bl) };
+                    for l in 3..=de {
+                        let ni = rel + l;
+                        unsafe {
+                            let mc = base_b + *len_full.get_unchecked(l);
+                            if mc < *dp_cost.get_unchecked(ni) {
+                                *dp_cost.get_unchecked_mut(ni) = mc;
+                                *dp_len.get_unchecked_mut(ni) = l as u16;
+                                *dp_dist.get_unchecked_mut(ni) = bpp as u16;
                             }
                         }
-                    } else {
-                        let de = dense_lim.min(bl);
-                        for l in 3..=de {
-                            let ni = rel + l;
-                            unsafe {
-                                let mc = base_b + *len_full.get_unchecked(l);
-                                if mc < *dp_cost.get_unchecked(ni) {
-                                    *dp_cost.get_unchecked_mut(ni) = mc;
-                                    *dp_len.get_unchecked_mut(ni) = l as u16;
-                                    *dp_dist.get_unchecked_mut(ni) = bpp as u16;
-                                }
-                            }
-                        }
-                        let ts = bl.saturating_sub(tail_pad).max(de + 1);
-                        for l in ts..=bl {
-                            let ni = rel + l;
-                            unsafe {
-                                let mc = base_b + *len_full.get_unchecked(l);
-                                if mc < *dp_cost.get_unchecked(ni) {
-                                    *dp_cost.get_unchecked_mut(ni) = mc;
-                                    *dp_len.get_unchecked_mut(ni) = l as u16;
-                                    *dp_dist.get_unchecked_mut(ni) = bpp as u16;
-                                }
+                    }
+                    let ts = bl.saturating_sub(tail_pad.max(2)).max(de + 1);
+                    for l in ts..=bl {
+                        let ni = rel + l;
+                        unsafe {
+                            let mc = base_b + *len_full.get_unchecked(l);
+                            if mc < *dp_cost.get_unchecked(ni) {
+                                *dp_cost.get_unchecked_mut(ni) = mc;
+                                *dp_len.get_unchecked_mut(ni) = l as u16;
+                                *dp_dist.get_unchecked_mut(ni) = bpp as u16;
                             }
                         }
                     }
@@ -2405,41 +2391,27 @@ fn optimal_parse_block(
             if rl >= 3 {
                 let base_r = c + row_dcost;
                 if row_nonmono {
-                    if exact_mode == 2 || rl <= dense_lim {
-                        for l in 3..=rl {
-                            let ni = rel + l;
-                            unsafe {
-                                let mc = base_r + *len_full.get_unchecked(l);
-                                if mc < *dp_cost.get_unchecked(ni) {
-                                    *dp_cost.get_unchecked_mut(ni) = mc;
-                                    *dp_len.get_unchecked_mut(ni) = l as u16;
-                                    *dp_dist.get_unchecked_mut(ni) = row_stride as u16;
-                                }
+                    let de = if exact_mode == 2 { rl.min(24) } else { dense_lim.min(rl) };
+                    for l in 3..=de {
+                        let ni = rel + l;
+                        unsafe {
+                            let mc = base_r + *len_full.get_unchecked(l);
+                            if mc < *dp_cost.get_unchecked(ni) {
+                                *dp_cost.get_unchecked_mut(ni) = mc;
+                                *dp_len.get_unchecked_mut(ni) = l as u16;
+                                *dp_dist.get_unchecked_mut(ni) = row_stride as u16;
                             }
                         }
-                    } else {
-                        let de = dense_lim.min(rl);
-                        for l in 3..=de {
-                            let ni = rel + l;
-                            unsafe {
-                                let mc = base_r + *len_full.get_unchecked(l);
-                                if mc < *dp_cost.get_unchecked(ni) {
-                                    *dp_cost.get_unchecked_mut(ni) = mc;
-                                    *dp_len.get_unchecked_mut(ni) = l as u16;
-                                    *dp_dist.get_unchecked_mut(ni) = row_stride as u16;
-                                }
-                            }
-                        }
-                        let ts = rl.saturating_sub(tail_pad).max(de + 1);
-                        for l in ts..=rl {
-                            let ni = rel + l;
-                            unsafe {
-                                let mc = base_r + *len_full.get_unchecked(l);
-                                if mc < *dp_cost.get_unchecked(ni) {
-                                    *dp_cost.get_unchecked_mut(ni) = mc;
-                                    *dp_len.get_unchecked_mut(ni) = l as u16;
-                                    *dp_dist.get_unchecked_mut(ni) = row_stride as u16;
-                                }
+                    }
+                    let ts = rl.saturating_sub(tail_pad.max(2)).max(de + 1);
+                    for l in ts..=rl {
+                        let ni = rel + l;
+                        unsafe {
+                            let mc = base_r + *len_full.get_unchecked(l);
+                            if mc < *dp_cost.get_unchecked(ni) {
+                                *dp_cost.get_unchecked_mut(ni) = mc;
+                                *dp_len.get_unchecked_mut(ni) = l as u16;
+                                *dp_dist.get_unchecked_mut(ni) = row_stride as u16;
                             }
                         }
                     }
@@ -2474,7 +2446,7 @@ fn optimal_parse_block(
                 {
                     let hl = match_len_fast(data, p - d, p, 3, max_l);
                     let base_h = c + hdc;
-                    let de = hl.min(16);
+                    let de = hl.min(12);
                     for l in 3..=de {
                         let ni = rel + l;
                         unsafe {
@@ -2926,8 +2898,8 @@ fn zopfli_optimize_range(
         iter += 1;
     }
 
-    // Exact integer-Huffman fixed-point polish (converges blocks strictly when final pass improved best_dyn!)
-    if allow_full_exact && iterations >= 6 && (sub_end - sub_start) <= 90_000 {
+    // Exact integer-Huffman fixed-point polish on small blocks when iterations >= 8
+    if allow_full_exact && iterations >= 8 && (sub_end - sub_start) <= 90_000 {
         if let Some(ref bd) = best_dyn {
             for i in 0..286 {
                 ll_cost[i] = if bd.ll_lens[i] > 0 { bd.ll_lens[i] as f32 } else { 16.0 };
@@ -3656,7 +3628,7 @@ pub extern "C" fn scout_zopfli_size(
         let b_end = mega_bounds[b + 1];
         precompute_scout_matches(
             data, &runs, b_start, b_end, &mut head, &mut prev, rstride,
-            bpp_u, 16, &mut pool,
+            bpp_u, 10, &mut pool,
         );
         // Fast exact_mode=0 global init (2 passes) -> Run-Aware DP split -> 1 local exact_mode=0 re-parse per block!
         let mut ll_cost = [0f32; 286];
@@ -3695,7 +3667,7 @@ pub extern "C" fn scout_zopfli_size(
         );
         let splits = split_token_stream_dp(
             tbl, data, b_start, b_end, rstride, &init.lit_lens, &init.dists, &init.pos_arr,
-            16, 96, true,
+            12, 96, true,
         );
         for s in 0..splits.len() - 1 {
             let ts = splits[s];
@@ -5273,8 +5245,7 @@ fn filter_viterbi_rust(
     let penalties = [
         120.0 * scale,
         360.0 * scale,
-        900.0 * scale,
-        1600.0 * scale,
+        1200.0 * scale,
         2600.0 * scale,
     ];
     let mut dp = vec![[0.0f64; 5]; h];
@@ -5622,7 +5593,7 @@ pub extern "C" fn polish_filter_candidate(
         for y0 in (0..hu).step_by(step) {
             let y1 = (y0 + step).min(hu);
             if step == 6 {
-                // Skip deep-interior uniform Filter-0 UI blocks on fine 6-row pass (saves ~1.5s, preserves all photo/edge polish!)
+                // Skip deep-interior uniform Filter-0 UI blocks on fine 6-row pass
                 let c0 = y0.saturating_sub(24);
                 let c1 = (y1 + 24).min(hu);
                 let mut all_zero = true;
